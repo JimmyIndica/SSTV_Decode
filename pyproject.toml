@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot36-decode"
+dynamic = ["version"]
+description = "Robot 36 SSTV decoder for audio, I/Q and raw SDR FM captures"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+test = ["pillow"]
+
+[project.scripts]
+robot36-decode = "robot36_decode.cli:main"
+
+[tool.setuptools]
+packages = ["robot36_decode"]
+
+[tool.setuptools.dynamic]
+version = { attr = "robot36_decode.cli.__version__" }
