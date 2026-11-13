@@ -5,7 +5,8 @@ from __future__ import annotations
 from math import gcd
 
 import numpy as np
-from scipy import signal
+
+from .filters import resample_poly
 
 
 def resample(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
@@ -30,4 +31,4 @@ def resample(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     divisor = gcd(int(src_rate), int(dst_rate))
     up = int(dst_rate) // divisor
     down = int(src_rate) // divisor
-    return signal.resample_poly(samples, up, down)
+    return resample_poly(samples, up, down)

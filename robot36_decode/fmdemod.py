@@ -26,8 +26,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import signal as sps
+import scipy.fft as sfft
 
+from .filters import WORKERS, convolve_same, firwin
 from .resample import resample
 
 AUDIO_RATE = 48000
@@ -37,11 +38,16 @@ TF_NFFT = 1024
 TF_AVG = 8  # FFT blocks averaged per time frame (~0.1 s at 78 kHz)
 BAND_WIDTH_HZ = 12000.0  # sliding window used to find the FM signal
 MIN_SCORE_RATIO = 1.2  # smoothed band score must exceed this times the noise level
+NOISE_INFLATION = 1.25  # quiet-fifth noise level this far above the beside-signal one: trimmed capture
 SCORE_SMOOTH_S = 1.0
 GAP_S = 4.0  # dropouts (interference, fades) shorter than this do not split the signal
 DEFAULT_EXPECTED_S = 38.0  # a Robot 36 transmission incl. VIS header and tail
 MAX_F0_JUMP_HZ = 3000.0
 POLY_DEGREE = 3
+# A frame whose power is below this fraction of the median frame power is a
+# dropout (the SDR delivered near-silence), not quiet sky: real noise varies by
+# a few dB, these gaps by 20-30 dB.
+DROPOUT_RATIO = 0.05
 
 # Demodulation.
 CHANNEL_HALF_BW_HZ = 7000.0  # wide enough for the full deviation of a strong signal
@@ -86,6 +92,8 @@ class FmLocation:
     track_t_s: np.ndarray  # frame centre times inside the signal
     track_hz: np.ndarray  # carrier estimate per frame (relative to the tuned centre)
     snr_ratio: float  # median in-band/out-of-band power ratio inside the signal
+    # Dropouts near or inside the signal, (start, end) in capture seconds.
+    dropouts_s: tuple[tuple[float, float], ...] = ()
 
     @property
     def duration_s(self) -> float:
@@ -103,6 +111,7 @@ class FmAudio:
     doppler_hz: np.ndarray  # carrier offset from the tuned centre frequency
     signal_start_s: float
     signal_end_s: float
+    dropouts_s: tuple[tuple[float, float], ...] = ()  # capture seconds; audio there is noise
 
     @property
     def doppler_rate_hz_per_s(self) -> float:
@@ -128,7 +137,8 @@ def _time_frequency_power(x: np.ndarray, fs: float) -> tuple[np.ndarray, float]:
     for first in range(0, frames, chunk):
         last = min(frames, first + chunk)
         blocks = x[first * TF_NFFT : last * TF_NFFT].reshape(-1, TF_NFFT) * window
-        spec = np.fft.fftshift(np.abs(np.fft.fft(blocks, axis=1)) ** 2, axes=1)
+        blocks = blocks.astype(np.complex128)  # same double-precision map as before
+        spec = np.fft.fftshift(np.abs(sfft.fft(blocks, axis=1, workers=WORKERS)) ** 2, axes=1)
         power[first // TF_AVG : last // TF_AVG] = spec.reshape(-1, TF_AVG, TF_NFFT).mean(axis=1)
     return power, TF_AVG * TF_NFFT / float(fs)
 
@@ -243,6 +253,14 @@ def locate_fm_signal(
     the automatic search cannot find a whole transmission.
     """
     power, frame_s = _time_frequency_power(x, fs)
+    # Dropouts must neither set the quiet level of a bin nor look like signal
+    # (normalised by the real noise floor, their spectrum is meaningless):
+    # give them the typical spectrum of the rest of the capture.
+    frame_power = power.mean(axis=1)
+    dropout = frame_power < DROPOUT_RATIO * np.median(frame_power)
+    if dropout.any() and not dropout.all():
+        power = power.copy()
+        power[dropout] = np.median(power[~dropout], axis=0)
     # Remove fixed spurs / the DC spike: normalise each bin by its quiet level.
     floor = np.percentile(power, 25, axis=0)
     floor = np.maximum(floor, np.median(floor) * 1e-3)
@@ -256,24 +274,45 @@ def locate_fm_signal(
     best = ratio.argmax(axis=1)
     score = ratio.max(axis=1)
     f0 = centres_hz[best]
+    # The same statistic away from each frame's strongest band: what noise
+    # alone scores, even in frames that hold the signal.
+    positions = np.arange(ratio.shape[1])
+    elsewhere = np.where(np.abs(positions[None, :] - best[:, None]) > bins, ratio, -np.inf).max(axis=1)
+    elsewhere = np.where(np.isfinite(elsewhere), elsewhere, score)
 
     # Smooth over ~1 s: a weak signal dips below the noise-relative threshold
     # frame by frame during fades and interference, but not on average.
     # (np.convolve "same" returns the longer input, so the kernel must not be
     # longer than the data: very short captures have only a few frames.)
     k = min(max(1, int(round(SCORE_SMOOTH_S / frame_s))), score.size)
-    score = np.convolve(score, np.ones(k) / k, mode="same")
+    kernel = np.ones(k) / k
+    if dropout.any() and not dropout.all():
+        # A dropout holds no information: it scores as noise, but it does not
+        # split a transmission either (gaps are measured without it, below).
+        score = score.copy()
+        score[dropout] = np.percentile(score[~dropout], 20)
+    score = np.convolve(score, kernel, mode="same")
+    # Noise level: the quietest fifth of the capture. A capture trimmed close
+    # to the transmission has too little dead air for that (the "quiet" fifth
+    # is signal and the threshold ends up above most of it), which shows as a
+    # level well above what noise scores beside the signal; then use the latter.
     noise = float(np.percentile(score, 20))
+    noise_beside = float(np.median(np.convolve(elsewhere, kernel, mode="same")))
+    if noise > NOISE_INFLATION * noise_beside:
+        noise = noise_beside
     threshold = noise * MIN_SCORE_RATIO
     if window is not None:
         return _window_location(q, score, f0, frame_s, fs, x.size / fs, threshold, window)
+
     active = np.flatnonzero(score > threshold)
     if active.size < 5:
         return None
 
-    # Split into segments on time gaps, then keep the strongest one.
+    # Split into segments on time gaps, then keep the strongest one. Time
+    # spent in dropouts does not count towards a gap.
     gap_frames = max(1, int(round(GAP_S / frame_s)))
-    splits = np.flatnonzero(np.diff(active) > gap_frames) + 1
+    live = np.cumsum(~dropout)
+    splits = np.flatnonzero(np.diff(live[active]) > gap_frames) + 1
     segments = np.split(active, splits)
     mass = [float(np.sum(score[s] - noise)) for s in segments]
     seg = segments[int(np.argmax(mass))]
@@ -288,7 +327,7 @@ def locate_fm_signal(
     run = in_seg[consistent & (score[in_seg] > threshold)]
     if run.size < 5:
         return None
-    splits = np.flatnonzero(np.diff(run) > gap_frames) + 1
+    splits = np.flatnonzero(np.diff(live[run]) > gap_frames) + 1
     run = max(np.split(run, splits), key=lambda r: float(np.sum(score[r] - noise)))
 
     centroid = _refine_centroids(q, run, t_frames, coarse, frame_s, fs)
@@ -306,13 +345,25 @@ def locate_fm_signal(
         start_s, end_s = float(run[0]) * frame_s, float(run[-1] + 1) * frame_s
 
     inband = float(np.median(score[run]))
+    gaps = []
+    for a, b in _runs(dropout):
+        a_s, b_s = a * frame_s, b * frame_s
+        if b_s > start_s - MARGIN_S and a_s < end_s + MARGIN_S:
+            gaps.append((a_s, b_s))
     return FmLocation(
         start_s=start_s,
         end_s=end_s,
         track_t_s=t_frames[run],
         track_hz=centroid,
         snr_ratio=inband,
+        dropouts_s=tuple(gaps),
     )
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """(start, end) index pairs of the runs of True in ``mask``."""
+    edges = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
+    return list(zip(np.flatnonzero(edges == 1).tolist(), np.flatnonzero(edges == -1).tolist()))
 
 
 # ---------------------------------------------------------------------------
@@ -328,13 +379,32 @@ def _discriminate(y: np.ndarray, fs: float) -> np.ndarray:
     return out * (fs / (2.0 * np.pi))
 
 
+def _mix_down(x: np.ndarray, fs: float, frequency_hz: np.ndarray) -> np.ndarray:
+    """``x * exp(-j * phase)`` where the phase integrates ``frequency_hz``.
+
+    The phase is accumulated in float64 (it reaches millions of radians) and
+    wrapped to one turn before the sine and cosine are taken in float32, which
+    is all the precision a ``complex64`` signal can use and several times
+    faster than a ``complex128`` exponential.
+    """
+    turns = np.cumsum(frequency_hz, dtype=np.float64) / fs
+    angle = (2.0 * np.pi) * (turns - np.floor(turns))
+    angle = angle.astype(np.float32)
+    rotor = np.empty(angle.size, dtype=np.complex64)
+    rotor.real = np.cos(angle)
+    rotor.imag = np.sin(angle)
+    rotor.imag *= -1.0
+    return x * rotor
+
+
+def _channel_taps(fs: float, half_bw_hz: float) -> np.ndarray:
+    return firwin(CHANNEL_TAPS, half_bw_hz, fs=fs, window=("kaiser", 6.0)).astype(np.float32)
+
+
 def _mix_filter_discriminate(
     x: np.ndarray, fs: float, carrier_hz: np.ndarray, half_bw_hz: float
 ) -> np.ndarray:
-    phase = 2.0 * np.pi * np.cumsum(carrier_hz, dtype=np.float64) / fs
-    mixed = x * np.exp(-1j * phase).astype(np.complex64)
-    taps = sps.firwin(CHANNEL_TAPS, half_bw_hz, fs=fs, window=("kaiser", 6.0)).astype(np.float32)
-    filtered = sps.oaconvolve(mixed, taps, mode="same")
+    filtered = convolve_same(_mix_down(x, fs, carrier_hz), _channel_taps(fs, half_bw_hz))
     return _discriminate(filtered, fs)
 
 
@@ -349,10 +419,13 @@ def _declick(disc: np.ndarray, limit_hz: float) -> np.ndarray:
     bad = np.abs(disc) > limit_hz
     if not bad.any():
         return disc
-    kernel = np.ones(2 * CLICK_GUARD + 1)
-    if disc.size < kernel.size:
+    if disc.size < 2 * CLICK_GUARD + 1:
         return disc
-    bad = np.convolve(bad.astype(np.float32), kernel, mode="same") > 0
+    # Widen each click by CLICK_GUARD samples on both sides.
+    core = bad.copy()
+    for shift in range(1, CLICK_GUARD + 1):
+        bad[shift:] |= core[:-shift]
+        bad[:-shift] |= core[shift:]
     good = np.flatnonzero(~bad)
     if good.size < 2:
         return np.zeros_like(disc)
@@ -414,6 +487,9 @@ def demodulate_fm(
     # carrier, and repeat.
     block = max(1, int(round(RESIDUAL_BLOCK_S * fs)))
     in_signal = (t_s >= location.start_s) & (t_s <= location.end_s)
+    for a_s, b_s in location.dropouts_s:
+        # Nothing to measure in a dropout: keep it out of the carrier fits.
+        in_signal &= (t_s < a_s) | (t_s >= b_s)
     for _ in range(REFINE_PASSES):
         disc = _mix_filter_discriminate(seg, fs, carrier, half_bw_hz)
         usable = np.flatnonzero(in_signal)
@@ -436,32 +512,25 @@ def demodulate_fm(
 
         def _lp(hz: float) -> np.ndarray:
             if ("lp", hz) not in taps:
-                taps[("lp", hz)] = sps.firwin(201, hz, fs=fs).astype(np.float32)
+                taps[("lp", hz)] = firwin(201, hz, fs=fs).astype(np.float32)
             return taps[("lp", hz)]
 
         def _narrow(hz: float) -> np.ndarray:
             if ("bw", hz) not in taps:
-                taps[("bw", hz)] = sps.firwin(
-                    CHANNEL_TAPS, hz, fs=fs, window=("kaiser", 6.0)
-                ).astype(np.float32)
+                taps[("bw", hz)] = _channel_taps(fs, hz)
             return taps[("bw", hz)]
 
         estimate = disc - np.median(disc)
         for bw_hz, lp_hz in feedback_schedule:
-            smooth = sps.oaconvolve(estimate, _lp(lp_hz), mode="same")
-            phase = 2.0 * np.pi * np.cumsum(carrier + smooth, dtype=np.float64) / fs
-            residual = sps.oaconvolve(
-                seg * np.exp(-1j * phase).astype(np.complex64), _narrow(bw_hz), mode="same"
-            )
+            smooth = convolve_same(estimate, _lp(lp_hz))
+            residual = convolve_same(_mix_down(seg, fs, carrier + smooth), _narrow(bw_hz))
             correction = _declick(_discriminate(residual, fs), CLICK_FACTOR * bw_hz)
             estimate = smooth + correction
         disc = estimate
     audio = _remove_dc(disc, fs)
     if audio_band_hz is not None:
-        band = sps.firwin(
-            AUDIO_BAND_TAPS, list(audio_band_hz), pass_zero=False, fs=fs
-        ).astype(np.float32)
-        audio = sps.oaconvolve(audio, band, mode="same")
+        band = firwin(AUDIO_BAND_TAPS, list(audio_band_hz), pass_zero=False, fs=fs).astype(np.float32)
+        audio = convolve_same(audio, band)
     if int(round(fs)) != audio_rate:
         audio = resample(audio, int(round(fs)), audio_rate)
     scale = np.percentile(np.abs(audio), 99.0)
@@ -479,4 +548,5 @@ def demodulate_fm(
         doppler_hz=np.polyval(final, doppler_t),
         signal_start_s=location.start_s,
         signal_end_s=location.end_s,
+        dropouts_s=location.dropouts_s,
     )

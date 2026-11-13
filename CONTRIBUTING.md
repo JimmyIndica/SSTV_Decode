@@ -12,8 +12,8 @@
 
 ## Run it and the tests
 
-    py -m pip install numpy scipy pillow          (Windows)
-    python3 -m pip install numpy scipy pillow     (macOS / Linux)
+    py -m pip install numpy scipy                 (Windows)
+    python3 -m pip install numpy scipy            (macOS / Linux)
     py -m robot36_decode capture.wav              (decode a file)
     py tests/test_roundtrip.py                    (all tests, ~2 minutes, must end "N/N tests passed")
 
@@ -39,4 +39,4 @@
 * Fixes should be DSP-level (how the signal is measured), not cosmetic post-processing of the picture.
 * Do not change spec timing (pixel offsets) without evidence from real captures.
 * New behaviour gets a test in `tests/test_roundtrip.py`; the file's runner (`_run_all`) stays at the end.
-* Do not commit captures or decoded PNGs (they are git-ignored); only the small benchmark in `tests/data`.
+* Do not commit captures or decoded PNGs (they are git-ignored). The tests build their own synthetic signals and delete their temporary files when they finish (`R36_KEEP_TMP=1` keeps them).

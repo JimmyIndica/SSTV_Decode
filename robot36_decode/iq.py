@@ -28,10 +28,14 @@ class IQData:
 TARGET_RATE = 48000
 
 
+RAW_FORMATS = ("f32", "s16")
+
+
 def read_iq(
     path: Path,
     raw_sample_rate: int = TARGET_RATE,
     target_rate: int | None = TARGET_RATE,
+    raw_format: str = "f32",
 ) -> IQData:
     """Read a raw IQ or complex WAV file.
 
@@ -48,8 +52,10 @@ def read_iq(
     * RIFF/RF64 ``WAVE`` files. Two channels are interpreted as complex
       baseband (I in channel 0, Q in channel 1); mono files are converted to a
       complex analytic signal.
-    * Raw binary with interleaved 32-bit floating-point I/Q samples
-      (``.iq`` / ``.raw`` style SDR captures) at ``raw_sample_rate``.
+    * Raw binary (no WAV header) with interleaved I/Q samples at
+      ``raw_sample_rate``: 32-bit float (``raw_format="f32"``, ``.iq`` /
+      ``.raw`` style captures) or 16-bit signed integer (``"s16"``, e.g. an
+      SDR WAV recording whose header was lost).
 
     Returns complex samples so the rest of the pipeline (sync tracking, VIS,
     decode) can run unchanged. ``target_rate`` is the rate the samples are
@@ -104,13 +110,18 @@ def read_iq(
 
         native = target_rate is None
         if encoding == "PCM" and bits == 16:
-            # Fast path for the common SDR recording format.
+            # Fast path for the common SDR recording format: no float copy of
+            # the whole file, I and Q go straight into the complex array.
             usable = (len(data_chunk) // 2) * 2
-            samples = np.frombuffer(data_chunk[:usable], dtype="<i2").astype(
-                np.float32 if native else np.float64
-            ) / 32768.0
+            samples = np.frombuffer(data_chunk[:usable], dtype="<i2")
+            scale = 1.0 / 32768.0
+        elif encoding == "float" and bits == 32:
+            usable = (len(data_chunk) // 4) * 4
+            samples = np.frombuffer(data_chunk[:usable], dtype="<f4")
+            scale = 1.0
         else:
             samples = _float_from_pcm(data_chunk, bits, encoding)
+            scale = 1.0
         if samples.size == 0:
             raise ValueError(f"{path} contains no audio samples")
         if samples.size % channels:
@@ -118,9 +129,13 @@ def read_iq(
         interleaved = samples.reshape(-1, channels)
 
         if channels > 1:
-            iq = interleaved[:, 0] + 1j * interleaved[:, 1]
+            iq = np.empty(interleaved.shape[0], dtype=np.complex64 if native else np.complex128)
+            iq.real = interleaved[:, 0]
+            iq.imag = interleaved[:, 1]
+            if scale != 1.0:
+                iq *= scale
         else:
-            iq = analytic_signal(interleaved[:, 0], sample_rate)
+            iq = analytic_signal(interleaved[:, 0].astype(np.float64) * scale, sample_rate)
 
         out_rate = sample_rate if native else target_rate
         if sample_rate != out_rate:
@@ -134,25 +149,43 @@ def read_iq(
             channels=channels,
         )
 
-    # Raw binary: interleaved 32-bit floating-point I/Q samples.
+    # Raw binary: interleaved I/Q samples without a header.
     if raw_sample_rate <= 0:
         raise ValueError("raw sample rate must be positive")
-    usable = (len(raw) // 4) * 4
-    samples_f4 = np.frombuffer(raw[:usable], dtype="<f4")
-    if samples_f4.size % 2:
-        samples_f4 = samples_f4[:-1]
-    if samples_f4.size >= 2 and np.all(np.isfinite(samples_f4)):
-        iq = samples_f4[0::2].astype(np.float64) + 1j * samples_f4[1::2].astype(np.float64)
-        native = target_rate is None
-        out_rate = raw_sample_rate if native else target_rate
-        if raw_sample_rate != out_rate:
-            iq = resample(iq, raw_sample_rate, out_rate)
-
-        return IQData(
-            samples=np.ascontiguousarray(iq, dtype=np.complex64 if native else np.complex128),
-            sample_rate=out_rate,
-            bits=32,
-            encoding="float32-iq",
-        )
-
-    raise ValueError(f"{path}: unsupported IQ data format (expected WAV or interleaved float32 IQ)")
+    if raw_format not in RAW_FORMATS:
+        raise ValueError(f"unknown raw format {raw_format!r} (expected one of {', '.join(RAW_FORMATS)})")
+    native = target_rate is None
+    if raw_format == "s16":
+        usable = (len(raw) // 4) * 4
+        pairs = np.frombuffer(raw[:usable], dtype="<i2").reshape(-1, 2)
+        if pairs.shape[0] < 2:
+            raise ValueError(f"{path} contains no I/Q samples")
+        iq = np.empty(pairs.shape[0], dtype=np.complex64 if native else np.complex128)
+        iq.real = pairs[:, 0]
+        iq.imag = pairs[:, 1]
+        iq *= 1.0 / 32768.0
+        bits, encoding = 16, "int16-iq"
+    else:
+        usable = (len(raw) // 4) * 4
+        samples_f4 = np.frombuffer(raw[:usable], dtype="<f4")
+        if samples_f4.size % 2:
+            samples_f4 = samples_f4[:-1]
+        if samples_f4.size < 2 or not np.all(np.isfinite(samples_f4)):
+            raise ValueError(
+                f"{path}: unsupported IQ data format (expected a WAV file or interleaved "
+                "float32 I/Q; for headerless 16-bit I/Q, such as an SDR WAV recording "
+                "whose header is damaged, use --raw-format s16 with --raw-sample-rate)"
+            )
+        iq = np.empty(samples_f4.size // 2, dtype=np.complex64 if native else np.complex128)
+        iq.real = samples_f4[0::2]
+        iq.imag = samples_f4[1::2]
+        bits, encoding = 32, "float32-iq"
+    out_rate = raw_sample_rate if native else target_rate
+    if raw_sample_rate != out_rate:
+        iq = resample(iq, raw_sample_rate, out_rate)
+    return IQData(
+        samples=np.ascontiguousarray(iq, dtype=np.complex64 if native else np.complex128),
+        sample_rate=out_rate,
+        bits=bits,
+        encoding=encoding,
+    )

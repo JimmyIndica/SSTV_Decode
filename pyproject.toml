@@ -10,9 +10,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy", "scipy"]
 
-[project.optional-dependencies]
-test = ["pillow"]
-
 [project.scripts]
 robot36-decode = "robot36_decode.cli:main"
 

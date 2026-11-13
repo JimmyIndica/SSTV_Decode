@@ -26,8 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy import ndimage as ndi
-from scipy import signal as sps
+import scipy.fft as sfft
 
 from .constants import LINE_MS, ROBOT36_VIS_CODE
 
@@ -62,10 +61,27 @@ class StartEstimate:
     notes: list[str] = field(default_factory=list)
 
 
+def _hilbert(x: np.ndarray) -> np.ndarray:
+    """Analytic signal without padding (as ``scipy.signal.hilbert``)."""
+    n = x.size
+    spectrum = sfft.fft(x)
+    gain = np.zeros(n)
+    if n % 2 == 0:
+        gain[0] = gain[n // 2] = 1.0
+        gain[1 : n // 2] = 2.0
+    else:
+        gain[0] = 1.0
+        gain[1 : (n + 1) // 2] = 2.0
+    return sfft.ifft(spectrum * gain)
+
+
 def _instantaneous_frequency(samples: np.ndarray, rate: int) -> np.ndarray:
-    analytic = samples if np.iscomplexobj(samples) else sps.hilbert(samples)
+    from scipy import ndimage  # only needed here; keeps the normal decode's imports light
+
+    analytic = samples if np.iscomplexobj(samples) else _hilbert(samples)
     freq = np.gradient(np.unwrap(np.angle(analytic))) * rate / (2.0 * np.pi)
-    return sps.medfilt(freq, int(0.0015 * rate) | 1)
+    # A median filter that pads with zeros, like scipy.signal.medfilt.
+    return ndimage.median_filter(freq, int(0.0015 * rate) | 1, mode="constant")
 
 
 def find_start(
@@ -92,7 +108,9 @@ def find_start(
 
     freq = _instantaneous_frequency(samples, rate)
     indicator = np.exp(-(((freq - 1200.0) / 120.0) ** 2))
-    indicator = ndi.uniform_filter1d(indicator, max(1, int(PULSE_S * rate)))
+    from scipy import ndimage
+
+    indicator = ndimage.uniform_filter1d(indicator, max(1, int(PULSE_S * rate)))
 
     # --- 1. sync comb -------------------------------------------------------
     folds = (i1 - i0) // line

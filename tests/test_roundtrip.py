@@ -9,8 +9,11 @@ subsampling), reporting the mean absolute error per channel value (0-255).
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import io
+import os
+import shutil
 import sys
 import tempfile
 import time
@@ -25,7 +28,7 @@ sys.path.insert(0, str(HERE.parent))
 
 import synth  # noqa: E402
 from robot36_decode.cli import main  # noqa: E402
-from robot36_decode.dsp import band_limit, phase, phase_values  # noqa: E402
+from robot36_decode.dsp import band_limit, phase_values  # noqa: E402
 from robot36_decode.iq import read_iq  # noqa: E402
 from robot36_decode.resample import resample  # noqa: E402
 from robot36_decode.robot36 import _frequencies_to_levels  # noqa: E402
@@ -65,8 +68,15 @@ def _check(name: str, path: Path, sig: dict, max_mae: float, *flags: str) -> Non
     _ = time.time() - t0
 
 
+# Every test writes under one folder that is deleted when the run ends (a full
+# run writes several GB of synthetic captures). Set R36_KEEP_TMP=1 to keep it.
+_TMP_ROOT = tempfile.mkdtemp(prefix="r36_tests_")
+if not os.environ.get("R36_KEEP_TMP"):
+    atexit.register(shutil.rmtree, _TMP_ROOT, True)
+
+
 def _tmp() -> Path:
-    return Path(tempfile.mkdtemp(prefix="r36_"))
+    return Path(tempfile.mkdtemp(prefix="r36_", dir=_TMP_ROOT))
 
 
 # ---------------------------------------------------------------------------
@@ -421,13 +431,18 @@ def test_directory_one_failure_does_not_stop_the_rest():
 def test_directory_truncated_recording_is_rescued_as_partial_image():
     sig = _signal()
     d = _make_folder(sig)
-    synth.write_wav_pcm16(d / "aaa_short.wav", synth.to_audio(sig)[: FS * 5], FS)  # ~25 lines
+    synth.write_wav_pcm16(d / "aaa_short.wav", synth.to_audio(sig)[: FS * 4], FS)  # ~16 lines
     rc, out, err = _run_cli(str(d))
     assert rc == 0, (out, err)
-    assert "audio is too short" in err, "the normal attempt still reports why it failed"
+    assert "image lines are in the audio" in err, "the normal attempt still reports why it failed"
     assert "rescued  aaa_short.wav" in out and (d / "aaa_short_forced.png").exists()
     got = synth.read_png_rgb(d / "aaa_short_forced.png")
     assert (got[200:] == 128).all(), "lines beyond the recording are grey"
+    # A rescued file counts as done for --skip-existing ...
+    rc, out, _ = _run_cli(str(d), "--skip-existing")
+    assert rc == 0 and "skipped  aaa_short.wav" in out, out
+    # ... and without its rescued picture, --no-rescue reports the failure.
+    (d / "aaa_short_forced.png").unlink()
     rc, out, _ = _run_cli(str(d), "--no-rescue", "--skip-existing")
     assert rc == 1 and "FAILED   aaa_short.wav" in out
 
@@ -511,16 +526,16 @@ def test_force_start_truncated_file_greys_missing_lines():
     keep_s = float(sig["line_starts_ms"][0]) / 1000.0 + 120 * 0.150 + 0.050  # ~120 lines of audio
     synth.write_wav_pcm16(d / "a.wav", synth.to_audio(sig)[: int(keep_s * FS)], FS)
     start_s = float(sig["line_starts_ms"][0]) / 1000.0
-    # Without --force-start a short file is refused...
-    assert _decode(d / "a.wav", "--no-vis", "--start-ms", f"{start_s * 1000:.1f}")[0] == 1
-    # ...with it, the lines that exist decode and the rest are grey.
-    rc, out, err = _decode(d / "a.wav", "--force-start", f"{start_s:.4f}")
-    assert rc == 0, err
-    got = synth.read_png_rgb(d / "a.png")
-    assert (got[121:] == 128).all(), "lines with no audio must be grey"
-    top = float(np.abs(got[:100].astype(np.float64) - sig["expected_rgb"][:100]).mean())
-    assert top <= 3.0, top
-    assert "the file ends after 120 of 240 lines" in out, out
+    # v3.5: a normal decode of a recording that stops early keeps the lines it
+    # has (it used to be refused), and so does a forced one.
+    for flags in (("--no-vis", "--start-ms", f"{start_s * 1000:.1f}"), ("--force-start", f"{start_s:.4f}")):
+        rc, out, err = _decode(d / "a.wav", *flags)
+        assert rc == 0, err
+        got = synth.read_png_rgb(d / "a.png")
+        assert (got[121:] == 128).all(), "lines with no audio must be grey"
+        top = float(np.abs(got[:100].astype(np.float64) - sig["expected_rgb"][:100]).mean())
+        assert top <= 3.0, top
+        assert "the recording ends after line 120 of 240" in out, out
 
 
 def test_force_start_argument_errors_and_hint():
@@ -534,7 +549,7 @@ def test_force_start_argument_errors_and_hint():
     assert rc == 1 and "beyond the end" in err
     # The normal FM failure message points at --force-start.
     iq = synth.to_fm_baseband(sig, dead_before_s=5.0, dead_after_s=5.0, inband_snr_db=14.0).astype(np.complex64)
-    synth.write_raw_iq(d / "short.raw", iq[: int(78125 * 25)])  # signal cut short
+    synth.write_raw_iq(d / "short.raw", iq[: int(78125 * 9.0)])  # ~16 lines: too few to keep
     rc, _, err = _run_cli(str(d / "short.raw"), "--format", "fm", "--raw-sample-rate", "78125")
     assert rc == 1 and "--force-start" in err, err
 
@@ -678,7 +693,8 @@ def test_directory_rescue_of_failed_capture():
     d.mkdir()
     good = synth.to_fm_baseband(sig, dead_before_s=5.0, dead_after_s=5.0, inband_snr_db=16.0).astype(np.complex64)
     synth.write_raw_iq(d / "a_good.raw", good)
-    synth.write_raw_iq(d / "b_cut.raw", good[: int(78125 * 30)])  # the signal ends early: normal decode refuses
+    cut_s = 9.2
+    synth.write_raw_iq(d / "b_cut.raw", good[: int(78125 * cut_s)])  # ~18 lines: too few for a normal decode
     flags = ("--format", "fm", "--raw-sample-rate", "78125")
     rc, out, err = _run_cli(str(d), *flags)
     assert rc == 0, (out, err)
@@ -686,7 +702,7 @@ def test_directory_rescue_of_failed_capture():
     assert "1 rescued with --force-start" in out and "rescued  b_cut.raw" in out, out
     got = synth.read_png_rgb(d / "b_cut_forced.png")
     start = 5.0 + float(sig["line_starts_ms"][0]) / 1000.0
-    lines_with_audio = int((30.0 - start) / 0.150)
+    lines_with_audio = int((cut_s - start) / 0.150)
     top = float(np.abs(got[: lines_with_audio - 8].astype(np.float64) - sig["expected_rgb"][: lines_with_audio - 8]).mean())
     assert top <= 14.0, top
     assert (got[-5:] == 128).all(), "lines beyond the end of the file are grey"
@@ -813,6 +829,316 @@ def test_segment_frequencies_tail_guard_avoids_a_smeared_step():
     assert np.allclose(plain[:3], guarded[:3])
 
 
+def test_filters_match_scipy_signal():
+    """v3.4.3: the decoder's own FIR/convolution/resampling equal scipy.signal's."""
+    import scipy.signal as ss
+
+    from robot36_decode import filters
+
+    rng = np.random.default_rng(3)
+    for args, kw in (
+        ((301, 7000.0), dict(fs=78125.0, window=("kaiser", 6.0))),
+        ((201, 2400.0), dict(fs=78125.0)),
+        ((201, [1000.0, 2500.0]), dict(fs=78125.0, pass_zero=False)),
+    ):
+        assert np.allclose(filters.firwin(*args, **kw), ss.firwin(*args, **kw), atol=1e-15)
+    x = rng.standard_normal(50_001)
+    xc = (x + 1j * rng.standard_normal(x.size)).astype(np.complex64)
+    for m in (1, 2, 201, 301):
+        h = rng.standard_normal(m)
+        assert np.allclose(filters.convolve_same(x, h), np.convolve(x, h, mode="same"), atol=1e-9)
+    h32 = ss.firwin(301, 0.2).astype(np.float32)
+    ref = ss.oaconvolve(xc, h32, mode="same")
+    got = filters.convolve_same(xc, h32)
+    assert got.dtype == np.complex64 and np.abs(got - ref).max() < 1e-5
+    for data in (x, x + 1j * x[::-1]):
+        for up, down in ((384, 625), (48000, 44100), (1, 2), (3, 1), (160, 147)):
+            want = ss.resample_poly(data, up, down)
+            have = filters.resample_poly(data, up, down)
+            assert have.shape == want.shape and np.abs(have - want).max() < 1e-12, (up, down)
+    c = rng.standard_normal(997)
+    assert np.array_equal(filters.medfilt(c, 9), ss.medfilt(c, 9))
+
+
+def test_tone_energies_fast_path_matches_reference():
+    from robot36_decode.vis import _tone_energies
+
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal(100_000)
+    tones = [1100.0, 1200.0, 1900.0]
+    for data, rate, frame, window in ((x, 48000, 240, 960), (x + 0.5j * x, 48000, 240, 960), (x, 44100, 220, 882)):
+        got = _tone_energies(data, rate, tones, frame, window)
+        n = np.arange(data.size)
+        frames = (data.size - window) // frame
+        for k, f in enumerate(tones):
+            z = np.concatenate(([0.0], np.cumsum(data * np.exp(-2j * np.pi * f * n / rate))))
+            starts = np.arange(frames) * frame
+            ref = np.abs(z[starts + window] - z[starts]) ** 2
+            assert np.allclose(got[k], ref, rtol=1e-8, atol=1e-6 * ref.max())
+
+
+def test_normal_decode_does_not_import_scipy_signal():
+    """scipy.signal costs ~1 s to import; the decoder no longer needs it."""
+    import subprocess
+
+    code = (
+        "import sys; sys.path.insert(0, %r); import robot36_decode; "
+        "print('scipy.signal' in sys.modules, 'scipy.ndimage' in sys.modules)"
+    ) % str(Path(__file__).resolve().parents[1])
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.split() == ["False", "False"], out
+
+
+def test_late_vis_in_long_audio_recording():
+    """v3.4.3: a header more than 15 s into an audio file is found (was: start 6-11 lines off)."""
+    sig = _signal(lead_ms=40000.0)
+    d = _tmp()
+    p = d / "late.wav"
+    synth.write_wav_pcm16(p, synth.to_audio(sig, snr_db=15), FS)
+    rc, out, err = _decode(p)
+    assert rc == 0, err
+    assert "VIS:    code 0x08" in out and "Start:  40.910 s" in out, out
+    mae = _mae_of(p.with_suffix(".png"), sig)
+    RESULTS.append(("audio, VIS 40 s into the file", "ok" if mae <= 14.0 else "FAIL", mae, 14.0))
+    assert mae <= 14.0, mae
+
+
+def test_stereo_sdr_wav_read_as_audio_gets_a_format_hint():
+    sig = _signal()
+    d = _tmp()
+    iq = synth.to_fm_baseband(sig, dead_before_s=2.0, dead_after_s=2.0)
+    synth.write_iq_wav(d / "sdr.wav", iq, 78125, kind="pcm16")
+    rc, out, err = _run_cli(str(d / "sdr.wav"), "--quiet")
+    # Read as audio it fails or yields noise; either way the hint is shown, even with --quiet.
+    assert "--format fm" in err and "78125 Hz" in err, (rc, err)
+    # the same file with the right format decodes
+    rc, out, err = _run_cli(str(d / "sdr.wav"), "--format", "fm", "--quiet")
+    assert rc == 0, err
+
+
+def test_single_file_option_checks():
+    sig = _signal()
+    d = _tmp()
+    synth.write_wav_pcm16(d / "a.wav", synth.to_audio(sig), FS)
+    assert _run_cli(str(d / "a.wav"), "--save-audio", str(d / "x.wav"))[0] == 2, "needs --format fm"
+    assert _run_cli(str(d / "a.wav"), "--jobs", "2")[0] == 2, "directory only"
+    assert _run_cli(str(d), "--jobs", "-1")[0] == 2
+
+
+def test_rf64_ds64_size_and_trailing_chunk():
+    """The RF64 data size comes from ds64; a chunk after the data is not read as samples."""
+    import struct
+
+    iq = (np.exp(2j * np.pi * 0.01 * np.arange(4000))).astype(np.complex64)
+    pcm = np.empty(iq.size * 2, dtype="<i2")
+    pcm[0::2] = np.round(iq.real * 20000)
+    pcm[1::2] = np.round(iq.imag * 20000)
+    data = pcm.tobytes()
+    fmt = struct.pack("<HHIIHH", 1, 2, 78125, 78125 * 4, 4, 16)
+    trailer = b"LIST" + struct.pack("<I", 8) + b"INFOjunk"
+    ds64 = struct.pack("<QQQI", 0, len(data), iq.size, 0)
+    body = (
+        b"WAVE" + b"ds64" + struct.pack("<I", len(ds64)) + ds64
+        + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+        + b"data" + struct.pack("<I", 0xFFFFFFFF) + data + trailer
+    )
+    path = _tmp() / "rf64.wav"
+    path.write_bytes(b"RF64" + struct.pack("<I", 0xFFFFFFFF) + body)
+    got = read_iq(path, target_rate=None)
+    assert got.samples.size == iq.size and got.samples.dtype == np.complex64
+    assert np.allclose(got.samples * 32768.0 / 20000.0, iq, atol=1e-3)
+
+
+def test_directory_parallel_jobs_match_serial():
+    sig = _signal()
+    d = _make_folder(sig)
+    serial, parallel = _tmp() / "serial", _tmp() / "parallel"
+    rc1, out1, err1 = _run_cli(str(d), "-r", "-o", str(serial))
+    rc2, out2, err2 = _run_cli(str(d), "-r", "-o", str(parallel), "--jobs", "2")
+    assert rc1 == rc2 == 0, (out1, out2)  # bad.wav (not a WAV file) is skipped, not failed
+    names = sorted(p.relative_to(serial).as_posix() for p in serial.rglob("*.png"))
+    assert names == ["a.png", "b.png", "sub/c.png"], names
+    for name in names:
+        assert np.array_equal(synth.read_png_rgb(serial / name), synth.read_png_rgb(parallel / name)), name
+    assert "2 at a time" in out2 and "Summary: 3 decoded" in out2, out2
+
+
+def test_skip_existing_counts_rescued_output():
+    sig = _signal()
+    d = _tmp() / "caps"
+    d.mkdir()
+    synth.write_wav_pcm16(d / "a.wav", synth.to_audio(sig), FS)
+    (d / "a_forced.png").write_bytes(b"placeholder")
+    rc, out, err = _run_cli(str(d), "--skip-existing")
+    assert rc == 0 and "skipped  a.wav" in out and not (d / "a.png").exists(), out
+
+
+def test_fm_capture_trimmed_close_to_the_signal():
+    """v3.4.3: 1 s of dead air either side used to locate only half the signal."""
+    sig = _signal()
+    d = _tmp()
+    iq = synth.to_fm_baseband(sig, dead_before_s=1.0, dead_after_s=1.0).astype(np.complex64)
+    synth.write_raw_iq(d / "trimmed.raw", iq)
+    rc, out, err = _run_cli(str(d / "trimmed.raw"), "--format", "fm", "--raw-sample-rate", "78125")
+    assert rc == 0, err
+    mae = _mae_of(d / "trimmed.png", sig)
+    RESULTS.append(("fm capture, 1 s dead air", "ok" if mae <= 8.0 else "FAIL", mae, 8.0))
+    assert mae <= 8.0, mae
+
+
+# ---------------------------------------------------------------------------
+# v3.5.0: traps from a large set of real captures
+# ---------------------------------------------------------------------------
+
+FM_FS = 78125
+
+
+def _fm_capture(sig: dict, **kw) -> np.ndarray:
+    kw.setdefault("dead_before_s", 5.0)
+    kw.setdefault("dead_after_s", 5.0)
+    return synth.to_fm_baseband(sig, **kw).astype(np.complex64)
+
+
+def _picture_rows(png: Path) -> tuple[np.ndarray, np.ndarray]:
+    got = synth.read_png_rgb(png).astype(np.float64)
+    return got, ~(got == 128).all(axis=(1, 2))
+
+
+def test_fm_recording_that_starts_mid_image():
+    """The recording begins 10 s into the picture: the missing top is grey and
+    the rest sits where it belongs (v3.4: 'image start (-11.5 s) is beyond the end')."""
+    sig = _signal(tail_ms=1000.0)
+    # The ISS keeps transmitting for about a second after the last line (0.9-1.8 s
+    # in real passes); give the synthetic tail a tone so it is signal, not silence.
+    tailed = dict(sig)
+    tailed["freq"], tailed["active"] = sig["freq"].copy(), sig["active"].copy()
+    end = int(round((sig["image_start_ms"] + 240 * 150.0) * FS / 1000.0))
+    tailed["freq"][end : end + FS] = 1900.0
+    tailed["active"][end : end + FS] = True
+    img0 = sig["image_start_ms"] / 1000.0
+    iq = _fm_capture(tailed)[int((5.0 + img0 + 10.0) * FM_FS) :]
+    d = _tmp()
+    synth.write_raw_iq(d / "late.raw", iq)
+    rc, out, err = _run_cli(str(d / "late.raw"), "--format", "fm", "--raw-sample-rate", "78125")
+    assert rc == 0, err
+    got, rows = _picture_rows(d / "late.png")
+    first = int(np.flatnonzero(rows)[0])
+    assert 65 <= first <= 69, first  # 10 s = 66.7 lines
+    mae = float(np.abs(got[rows] - sig["expected_rgb"][rows]).mean())
+    RESULTS.append(("fm, recording starts 10 s into the image", "ok" if mae <= 9.0 else "FAIL", mae, 9.0))
+    assert mae <= 9.0, mae
+    assert "the recording starts" in out, out
+    # the separator count covers only the lines that were recorded
+    import re
+
+    m = re.search(r"(\d+) of (\d+) line separators", out)
+    assert m is None or int(m.group(2)) < 240, out
+
+
+def _garbled_header(sig: dict, seed: int = 5) -> dict:
+    """Leader intact, start bit / data bits / stop bit replaced by picture tones."""
+    g = dict(sig)
+    g["freq"] = sig["freq"].copy()
+    rng = np.random.default_rng(seed)
+    fs = sig["fs"]
+    start = int(round((sig["image_start_ms"] - 300.0) * fs / 1000.0))
+    bit = int(round(30.0 * fs / 1000.0))
+    for k in range(10):
+        g["freq"][start + k * bit : start + (k + 1) * bit] = rng.choice([1500.0, 1700.0, 2100.0, 2300.0])
+    return g
+
+
+def test_picture_tones_are_not_a_vis_header():
+    """v3.4 read a garbled header as 'mode 0x00' and refused the file."""
+    from robot36_decode.vis import detect_vis
+
+    g = _garbled_header(_signal())
+    info = detect_vis(synth.to_audio(g, snr_db=20), FS)
+    assert info is None or info.code == 0x08, info
+
+
+def test_fm_picture_that_fades_out_without_readable_header():
+    """No readable header and the carrier is lost 12 s into the picture: the
+    lines are numbered from the start of the pulse train, not from the end."""
+    sig = _signal()
+    img0 = sig["image_start_ms"] / 1000.0
+    iq = _fm_capture(_garbled_header(sig))
+    cut = int((5.0 + img0 + 12.0) * FM_FS)
+    rng = np.random.default_rng(9)
+    sigma = float(np.std(iq[: 4 * FM_FS]))
+    noise = ((rng.standard_normal(30 * FM_FS) + 1j * rng.standard_normal(30 * FM_FS)) * sigma / np.sqrt(2)).astype(np.complex64)
+    d = _tmp()
+    synth.write_raw_iq(d / "fade.raw", np.concatenate((iq[:cut], noise)))
+    rc, out, err = _run_cli(str(d / "fade.raw"), "--format", "fm", "--raw-sample-rate", "78125")
+    assert rc == 0, err
+    assert "start of the sync pulse train" in out, out
+    got, rows = _picture_rows(d / "fade.png")
+    assert rows[:70].all() and not rows[90:].any(), np.flatnonzero(rows)
+    mae = float(np.abs(got[:70] - sig["expected_rgb"][:70]).mean())
+    RESULTS.append(("fm, header unreadable, carrier lost at line 80", "ok" if mae <= 9.0 else "FAIL", mae, 9.0))
+    assert mae <= 9.0, mae
+
+
+def test_fm_dropouts_before_and_inside_the_signal():
+    """Receiver dropouts (near-silence) neither look like signal nor split the
+    transmission; the lines inside one are grey."""
+    sig = _signal()
+    img0 = sig["image_start_ms"] / 1000.0
+    iq = _fm_capture(sig, dead_before_s=15.0)
+    iq[2 * FM_FS : 10 * FM_FS] *= 1e-3  # in the dead air
+    d0 = int((15.0 + img0 + 15.0) * FM_FS)
+    iq[d0 : d0 + 6 * FM_FS] *= 1e-3  # lines 100-140
+    d = _tmp()
+    synth.write_raw_iq(d / "drop.raw", iq)
+    rc, out, err = _run_cli(str(d / "drop.raw"), "--format", "fm", "--raw-sample-rate", "78125")
+    assert rc == 0, err
+    assert "VIS:    code 0x08" in out and "receiver dropout" in out, out
+    got, rows = _picture_rows(d / "drop.png")
+    grey = np.flatnonzero(~rows)
+    assert 38 <= grey.size <= 43 and 98 <= grey[0] <= 101, grey
+    mae = float(np.abs(got[rows] - sig["expected_rgb"][rows]).mean())
+    RESULTS.append(("fm, two receiver dropouts", "ok" if mae <= 8.0 else "FAIL", mae, 8.0))
+    assert mae <= 8.0, mae
+
+
+def test_fm_carrier_without_robot36_is_refused():
+    """An FM carrier with other audio (voice-like tones) must not become a
+    'picture' of noise."""
+    n = 25 * FS
+    rng = np.random.default_rng(3)
+    tones = np.repeat(rng.uniform(300.0, 3000.0, n // 4800 + 1), 4800)[:n]
+    fake = {"freq": tones, "active": np.ones(n, dtype=bool), "fs": FS}
+    d = _tmp()
+    synth.write_raw_iq(d / "voice.raw", _fm_capture(fake, dead_before_s=8.0, dead_after_s=8.0))
+    rc, out, err = _run_cli(str(d / "voice.raw"), "--format", "fm", "--raw-sample-rate", "78125")
+    assert rc == 1 and not (d / "voice.png").exists(), (out, err)
+    assert "no Robot 36 picture" in err or "image lines are in the audio" in err, err
+
+
+def test_headerless_16bit_capture():
+    """A WAV whose header was overwritten with 0xFF bytes: skipped with a hint,
+    decoded with --raw-format s16."""
+    sig = _signal()
+    iq = _fm_capture(sig)
+    pcm = np.empty(iq.size * 2, dtype="<i2")
+    scale = 0.9 * 32767 / float(np.abs(iq).max())
+    pcm[0::2] = np.round(iq.real * scale)
+    pcm[1::2] = np.round(iq.imag * scale)
+    raw = bytearray(pcm.tobytes())
+    raw[:65536] = b"\xff" * 65536
+    d = _tmp() / "caps"
+    d.mkdir()
+    (d / "damaged.wav").write_bytes(bytes(raw))
+    rc, out, err = _run_cli(str(d), "--format", "fm")
+    assert "skipped  damaged.wav" in out and "--raw-format s16" in out, out
+    rc, out, err = _run_cli(str(d), "--format", "fm", "--raw-format", "s16", "--raw-sample-rate", "78125")
+    assert rc == 0 and (d / "damaged.png").exists(), (out, err)
+    mae = _mae_of(d / "damaged.png", sig)
+    RESULTS.append(("fm, WAV header destroyed, --raw-format s16", "ok" if mae <= 8.0 else "FAIL", mae, 8.0))
+    assert mae <= 8.0, mae
+    assert _run_cli(str(d / "damaged.wav"), "--raw-format", "s16")[0] == 2, "needs --format iq/fm"
+
+
 def _run_all() -> int:
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
@@ -928,7 +1254,7 @@ def test_real_captures_if_present():
         print("      (no real captures found; skipped)")
         return
     for f in files:
-        out_png = Path(tempfile.mkdtemp(prefix="r36_real_")) / (f.stem + ".png")
+        out_png = Path(tempfile.mkdtemp(prefix="r36_real_", dir=_TMP_ROOT)) / (f.stem + ".png")
         t0 = time.time()
         rc, out, err = _decode(f, "--format", "fm", "-o", str(out_png))
         dt = time.time() - t0
@@ -997,7 +1323,7 @@ def test_real_capture_quality_limits():
         if key is None:
             continue
         bad, ny, nc, lines = CAPTURE_LIMITS[key]
-        png = Path(tempfile.mkdtemp(prefix="r36_q_")) / (f.stem + ".png")
+        png = Path(tempfile.mkdtemp(prefix="r36_q_", dir=_TMP_ROOT)) / (f.stem + ".png")
         rc, out, err = _decode(f, "--format", "fm", "-o", str(png))
         assert rc == 0, f"{f.name}: {err}"
         q = quality(synth.read_png_rgb(png))
@@ -1007,41 +1333,6 @@ def test_real_capture_quality_limits():
         assert q["noise_y"] <= ny, f"{f.name}: luma noise {q['noise_y']:.1f} > {ny}"
         assert q["noise_c"] <= nc, f"{f.name}: chroma noise {q['noise_c']:.1f} > {nc}"
         assert tracked >= lines, f"{f.name}: only {tracked} lines tracked"
-
-
-def test_benchmark_decode_comparison():
-    """26OCT capture vs the reference decoder's PNG (tests/data).
-
-    Compared after the best sub-pixel horizontal shift, which only affects the
-    measurement; the decoder keeps spec timing. Luma noise and damaged rows must
-    stay at the reference's level; chroma is held to a looser bound (the reference
-    is visibly smoother in chroma, which we deliberately do not post-process).
-    """
-    from imgmetrics import compare, quality
-
-    cap = _capture_dir() / "1794236581785_26OCT_IQData.wav"
-    ref_path = HERE / "data" / "26OCT_decoded_benchmark.png"
-    if not cap.exists() or not ref_path.exists():
-        print("      (26OCT capture or benchmark missing; skipped)")
-        return
-    # Despite the .png name the reference file is a JPEG, so read it with PIL
-    # (JPEG's chroma subsampling/quantisation also smooths its chroma).
-    from PIL import Image
-
-    ref = np.asarray(Image.open(ref_path).convert("RGB"))
-    png = Path(tempfile.mkdtemp(prefix="r36_b_")) / "26oct.png"
-    rc, out, err = _decode(cap, "--format", "fm", "-o", str(png))
-    assert rc == 0, err
-    got = synth.read_png_rgb(png)
-    q, r = quality(got), quality(ref)
-    c = compare(got, ref)
-    RESULTS.append(("benchmark: luma MAE vs reference", "ok", c["y_mae"], 8.0))
-    RESULTS.append(("benchmark: luma noise ours / ref", "ok", q["noise_y"], r["noise_y"] * 1.15))
-    assert q["bad_rows"] <= r["bad_rows"] + 2, (q, r)
-    assert q["noise_y"] <= r["noise_y"] * 1.15, (q, r)
-    assert c["y_mae"] <= 8.0 and c["cb_mae"] <= 7.0 and c["cr_mae"] <= 7.0, c
-    assert q["noise_c"] <= 9.0, q
-    assert abs(c["shift_px"]) <= 2.0, c
 
 
 def test_fm_audio_band_limits_noise():

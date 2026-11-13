@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import scipy.fft as sfft
 
 from .constants import (
     ANALYSIS_BAND_AUTO_RATIO,
@@ -17,6 +18,7 @@ def analytic_signal(x: np.ndarray, sample_rate: int = 48000) -> np.ndarray:
     """Return the analytic signal using the Hilbert transform."""
     if np.iscomplexobj(x):
         return x
+    x = np.asarray(x, dtype=np.float64)  # double precision, as numpy.fft always used
     n = x.shape[0]
     if n == 0:
         return x.astype(np.complex128)
@@ -25,16 +27,13 @@ def analytic_signal(x: np.ndarray, sample_rate: int = 48000) -> np.ndarray:
     pad = min(n, max(32, int(0.02 * float(sample_rate))))
     padded = np.pad(x, (pad, pad), mode="reflect")
     nfft = 1 << (padded.size - 1).bit_length()
-    spectrum = np.fft.fft(padded, nfft)
-    multiplier = np.zeros(nfft, dtype=np.float64)
-    if nfft % 2 == 0:
-        multiplier[0] = 1.0
-        multiplier[nfft // 2] = 1.0
-        multiplier[1 : nfft // 2] = 2.0
-    else:
-        multiplier[0] = 1.0
-        multiplier[1 : (nfft + 1) // 2] = 2.0
-    analytic = np.fft.ifft(spectrum * multiplier)
+    # One-sided spectrum: DC and Nyquist kept, positive frequencies doubled,
+    # negative ones zero. The real FFT gives the positive half directly.
+    half = sfft.rfft(padded, nfft)
+    half[1 : nfft // 2] *= 2.0
+    spectrum = np.zeros(nfft, dtype=half.dtype)
+    spectrum[: half.size] = half
+    analytic = sfft.ifft(spectrum, overwrite_x=True)
     return analytic[pad : pad + n]
 
 
@@ -95,12 +94,17 @@ def band_limit(
     Real-valued signals are filtered through the real FFT; complex signals go
     through the full complex FFT.
     """
+    # scipy.fft keeps single precision for single-precision input; analysis
+    # is done in double precision (as numpy.fft always did).
+    samples = np.asarray(
+        samples, dtype=np.complex128 if np.iscomplexobj(samples) else np.float64
+    )
     n = int(samples.shape[0])
     low = max(float(low_hz) + float(tone_offset_hz) + float(band_span_hz[0]), 50.0)
     high = float(high_hz) + float(tone_offset_hz) + float(band_span_hz[1])
 
     if np.iscomplexobj(samples):
-        spectrum = np.fft.fft(samples, axis=0)
+        spectrum = sfft.fft(samples, axis=0)
         # Signed bin frequencies: negative baseband frequencies are negative
         # here, so only the positive-frequency (analytic) passband is kept.
         freqs = np.fft.fftfreq(n, d=1.0 / float(sample_rate))
@@ -108,15 +112,15 @@ def band_limit(
         should_filter = auto and _out_of_band_fraction(spectrum, gain) > ANALYSIS_BAND_AUTO_RATIO
         if not should_filter:
             return samples
-        return np.fft.ifft(spectrum * gain, axis=0)
+        return sfft.ifft(spectrum * gain, axis=0)
 
-    spectrum = np.fft.rfft(samples, axis=0)
+    spectrum = sfft.rfft(samples, axis=0)
     freqs = np.arange(spectrum.size, dtype=np.float64) * (float(sample_rate) / n)
     gain = _bandpass_gain(freqs, low, high, taper_hz)
     should_filter = auto and _out_of_band_fraction(spectrum, gain) > ANALYSIS_BAND_AUTO_RATIO
     if not should_filter:
         return samples
-    return np.fft.irfft(spectrum * gain, n=n, axis=0)
+    return sfft.irfft(spectrum * gain, n=n, axis=0)
 
 
 def phase(
@@ -381,8 +385,8 @@ def dominant_frequency(
     end = min(int(samples.shape[0]), end)
     if end - start < 2:
         return 0.0
-    segment = samples[start:end]
-    spectrum = np.fft.fft(segment, axis=0)
+    segment = np.asarray(samples[start:end], dtype=np.complex128)
+    spectrum = sfft.fft(segment, axis=0)
     n = int(segment.shape[0])
     freqs = np.arange(n, dtype=np.float64) * (float(sample_rate) / n)
     gain = _bandpass_gain(freqs, low, high, float(taper_hz))

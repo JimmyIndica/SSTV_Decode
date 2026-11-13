@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.signal import medfilt
 
 from .constants import (
     FREQ_SYNC,
@@ -17,6 +16,7 @@ from .constants import (
     VIS_HEADER_MS,
     VIS_LEADER_MS,
 )
+from .filters import medfilt
 from .dsp import (
     centered_frequencies,
     downward_crossing,
@@ -141,7 +141,6 @@ SPECTRAL_MIN_PEAK_RATIO = 2.0  # best template score over the best one elsewhere
 SPECTRAL_MAX_BIT_ERRORS = 1
 SPECTRAL_MIN_Z = 10.0  # robust z-score of the best score over all positions
 SPECTRAL_EXCLUDE_MS = 350.0
-_TONE_CLIP = 30.0
 
 
 def _tone_energies(
@@ -151,15 +150,32 @@ def _tone_energies(
 
     Each tone is a heterodyne plus boxcar integration over ``window`` samples,
     i.e. a sliding single-bin DFT, so it integrates the tone over the whole
-    window instead of deciding per sample.
+    window instead of deciding per sample. Frame ``i`` covers samples
+    ``[i * frame, i * frame + window)``.
+
+    When the window is a whole number of frames, each frame's heterodyne sum
+    is one matrix product for all tones at once, and the windows are sums of
+    consecutive frames (a few thousand values instead of one per sample).
     """
     n = samples.size
-    t = np.arange(n, dtype=np.float64) / sample_rate
     frames = (n - window) // frame
+    if frames <= 0:
+        return np.empty((len(tones_hz), 0))
+    omega = 2.0 * np.pi * np.asarray(tones_hz, dtype=np.float64) / sample_rate
+    if window % frame == 0:
+        per = window // frame
+        blocks = frames + per - 1
+        x = samples[: blocks * frame].reshape(blocks, frame)
+        local = np.exp(-1j * np.outer(np.arange(frame), omega))  # (frame, tones)
+        sums = x @ local  # heterodyne sum of each block, block-relative phase
+        sums *= np.exp(-1j * np.outer(np.arange(blocks) * frame, omega))
+        csum = np.concatenate((np.zeros((1, omega.size), dtype=sums.dtype), np.cumsum(sums, axis=0)))
+        return (np.abs(csum[per : per + frames] - csum[:frames]) ** 2).T
+    t = np.arange(n, dtype=np.float64)
     starts = np.arange(frames) * frame
     out = np.empty((len(tones_hz), frames))
-    for k, f in enumerate(tones_hz):
-        z = samples * np.exp(-2j * np.pi * f * t)
+    for k, w in enumerate(omega):
+        z = samples * np.exp(-1j * w * t)
         csum = np.concatenate(([0.0], np.cumsum(z)))
         out[k] = np.abs(csum[starts + window] - csum[starts]) ** 2
     return out
@@ -292,4 +308,45 @@ def detect_vis(
     # confirm it; if the template finds nothing, report what was read (a
     # genuine header of another mode is then rejected by the caller).
     spectral = _detect_vis_spectral(samples, sample_rate, tone_offset_hz)
-    return spectral if spectral is not None else info
+    if spectral is not None:
+        return spectral
+    if info is not None and not _header_tones_ok(samples, sample_rate, info, tone_offset_hz, phase_track):
+        # Picture content can look like a leader (mid-grey is 1900 Hz) and its
+        # pixels then read as "bits"; that is no header at all.
+        return None
+    return info
+
+
+HEADER_TONE_TOLERANCE_HZ = 80.0
+
+
+def _header_tones_ok(
+    samples: np.ndarray,
+    sample_rate: int,
+    info: VisInfo,
+    tone_offset_hz: float,
+    phase_track: np.ndarray | None,
+) -> bool:
+    """True when ``info`` sits on real VIS tones: 1200 Hz start and stop bits
+    and data bits at 1100 or 1300 Hz (any mode's header has them)."""
+    count = int(min(VIS_SEARCH_MS, 1000.0 * samples.size / sample_rate) * sample_rate / 1000.0)
+    if phase_track is None:
+        track = phase(samples[:count], sample_rate, tone_offset_hz=tone_offset_hz)
+    else:
+        track = phase_track[:count]
+    end_ms = 1000.0 * track.size / sample_rate
+
+    def tone(bit: int) -> float | None:
+        begin = info.start_bit_ms + bit * VIS_BIT_MS + 7.0
+        if begin < 0.0 or begin + 16.0 > end_ms:
+            return None
+        return frequency_between(track, sample_rate, begin, begin + 16.0) - tone_offset_hz
+
+    edges = [tone(0), tone(9)]
+    if any(f is None or abs(f - FREQ_SYNC) > HEADER_TONE_TOLERANCE_HZ for f in edges):
+        return False
+    for bit in range(1, 9):
+        f = tone(bit)
+        if f is None or min(abs(f - FREQ_VIS_BIT_0), abs(f - FREQ_VIS_BIT_1)) > HEADER_TONE_TOLERANCE_HZ:
+            return False
+    return True

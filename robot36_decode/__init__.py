@@ -1,4 +1,4 @@
-"""Robot 36 SSTV decoder package (IQ version)."""
+"""Robot 36 SSTV decoder: audio, I/Q and SDR FM baseband captures."""
 
 from __future__ import annotations
 

@@ -35,6 +35,7 @@ class DecodeStats:
     separator_mismatches: int
     line_scale: float = 1.0
     repaired_lines: int = 0
+    checked_lines: int = LINES  # lines whose separator was judged (lines with audio)
 
 
 REPAIR_MIN_DEVIATION = 30.0  # levels (0-255) of mean deviation before a line is suspect
@@ -87,6 +88,7 @@ def decode_robot36(
     line_offsets_hz: np.ndarray | None = None,
     phase_track: np.ndarray | None = None,
     repair_lines: bool = False,
+    line_valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, DecodeStats]:
     """Decode Robot 36 audio.
 
@@ -101,7 +103,9 @@ def decode_robot36(
     that with a per-line offset, so a drifting Doppler shift is removed line by
     line; the offsets are measured against the time-scaled nominal tones, as
     produced by the sync tracker. ``phase_track`` may be the precomputed phase
-    of ``samples``.
+    of ``samples``. ``line_valid`` (one bool per line) marks the lines that
+    have audio; only those take part in the Cr/Cb order vote and the
+    separator-mismatch count (lines of a partial recording are padding).
     """
     if phase_track is None:
         phase_track = phase(samples, sample_rate, tone_offset_hz=tone_offset_hz)
@@ -189,14 +193,19 @@ def decode_robot36(
 
     # The header alternates Cr and Cb, but use a majority vote over the whole
     # frame so a single bad separator cannot swap the colours.
+    valid = np.ones(LINES, dtype=bool) if line_valid is None else np.asarray(line_valid, dtype=bool)
+    if not valid.any():
+        valid = np.ones(LINES, dtype=bool)
+    even = np.zeros(LINES, dtype=bool)
+    even[0::2] = True
     even_is_cb = bool(
-        np.count_nonzero(separator_is_cb[0::2])
-        > np.count_nonzero(~separator_is_cb[0::2])
+        np.count_nonzero(separator_is_cb & even & valid)
+        > np.count_nonzero(~separator_is_cb & even & valid)
     )
     expected = np.zeros(LINES, dtype=bool)
     expected[0::2] = even_is_cb
     expected[1::2] = not even_is_cb
-    separator_mismatches = int(np.count_nonzero(separator_is_cb != expected))
+    separator_mismatches = int(np.count_nonzero((separator_is_cb != expected) & valid))
 
     # Robot 36 uses 4:2:0 colour: each Cr/Cb pair is shared by both luma rows
     # in the line pair.
@@ -216,5 +225,6 @@ def decode_robot36(
         separator_mismatches=separator_mismatches,
         line_scale=line_scale,
         repaired_lines=repaired,
+        checked_lines=int(np.count_nonzero(valid)),
     )
     return ycbcr_to_rgb(luma, cb, cr), stats

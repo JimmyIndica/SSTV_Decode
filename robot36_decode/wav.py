@@ -17,6 +17,7 @@ class WavData:
     channels: int
     bits: int
     encoding: str
+    source_rate: int | None = None  # the file's own rate, before resampling to 48 kHz
 
     @property
     def duration_ms(self) -> float:
@@ -53,19 +54,26 @@ def _float_from_pcm(data: bytes, bits: int, encoding: str) -> np.ndarray:
 def _iter_chunks(raw: bytes):
     """Yield ``(chunk_id, body)`` pairs for a RIFF or RF64 WAVE payload.
 
-    Both container flavours share the RIFF chunk layout in practice (chunk
-    size is a 32-bit little-endian field); RF64 files just carry the magic and
-    use an ``0xFFFFFFFF`` size placeholder plus a ``ds64`` chunk for the real
-    (possibly >4 GiB) values. Oversized placeholder sizes are clamped to the
-    remaining buffer.
+    Both container flavours share the RIFF chunk layout (chunk size is a
+    32-bit little-endian field). RF64 files put a ``0xFFFFFFFF`` placeholder
+    in the size fields and the real 64-bit sizes in a ``ds64`` chunk, which
+    is read here; any size that runs past the end of the buffer is clamped
+    (truncated recordings). Bodies are ``memoryview`` slices, so the (large)
+    data chunk is not copied.
     """
+    view = memoryview(raw)
+    data_size_64: int | None = None
     pos = 12
     while pos + 8 <= len(raw):
-        chunk_id = raw[pos : pos + 4]
+        chunk_id = bytes(raw[pos : pos + 4])
         chunk_size = int.from_bytes(raw[pos + 4 : pos + 8], "little")
+        if chunk_id == b"ds64" and chunk_size >= 16:
+            data_size_64 = int.from_bytes(raw[pos + 16 : pos + 24], "little")
+        if chunk_id == b"data" and chunk_size == 0xFFFFFFFF and data_size_64 is not None:
+            chunk_size = data_size_64
         body_start = pos + 8
         end = body_start + chunk_size
-        yield chunk_id, raw[body_start : min(end, len(raw))]
+        yield chunk_id, view[body_start : min(end, len(raw))]
         pos = end + (chunk_size & 1)
         if chunk_id == b"data":
             return
@@ -156,4 +164,5 @@ def read_wav(path: Path) -> WavData:
         channels=channels,
         bits=bits,
         encoding=encoding,
+        source_rate=sample_rate,
     )

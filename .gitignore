@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Decoder output and captures (large, local to each user)
+*.png
+*.wav
+*.iq
+*.raw
+captures/
+decoded/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

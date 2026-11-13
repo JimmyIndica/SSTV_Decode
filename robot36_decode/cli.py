@@ -11,7 +11,6 @@ import numpy as np
 
 from .constants import (
     FREQ_BLACK,
-    FREQ_SYNC,
     FREQ_WHITE,
     IMAGE_MS,
     LINE_MS,
@@ -23,7 +22,7 @@ from .findstart import StartEstimate, find_start, format_report
 from .image import write_png
 from .robot36 import decode_robot36
 from .synctrack import SyncTrack, track_line_starts
-from .vis import VisInfo, detect_vis
+from .vis import VIS_SEARCH_MS, VisInfo, detect_vis
 from .wav import WavData, read_wav
 from .iq import IQData, read_iq
 from .fmdemod import (
@@ -33,7 +32,7 @@ from .fmdemod import (
     locate_fm_signal,
 )
 
-__version__ = "3.4.2"
+__version__ = "3.5.0"
 
 # A sync-tone offset larger than this (Hz) triggers a second pass so VIS
 # detection and band-limiting follow the shifted signal.
@@ -157,7 +156,7 @@ def _force_start_value(text: str) -> float | str:
 def _estimate_start(args: argparse.Namespace, input_path: Path) -> StartEstimate:
     """Find the first-line time of a (poor) capture; see :mod:`.findstart`."""
     if args.format == "fm":
-        native = read_iq(input_path, raw_sample_rate=args.raw_sample_rate, target_rate=None)
+        native = read_iq(input_path, raw_sample_rate=args.raw_sample_rate, target_rate=None, raw_format=args.raw_format or "f32")
         samples = np.conj(native.samples) if args.invert_iq else native.samples
         _check_capture_length(samples, native.sample_rate)
         location = locate_fm_signal(samples, native.sample_rate, args.signal_seconds)
@@ -183,7 +182,7 @@ def _estimate_start(args: argparse.Namespace, input_path: Path) -> StartEstimate
         )
         audio, rate, t0_s = fm.audio, fm.sample_rate, fm.t0_s
     else:
-        data = read_iq(input_path, raw_sample_rate=args.raw_sample_rate) if args.format == "iq" else read_wav(input_path)
+        data = read_iq(input_path, raw_sample_rate=args.raw_sample_rate, raw_format=args.raw_format or "f32") if args.format == "iq" else read_wav(input_path)
         if args.format == "iq" and args.invert_iq:
             data.samples = np.conj(data.samples)
         audio, rate, t0_s = data.samples, data.sample_rate, 0.0
@@ -199,6 +198,8 @@ def _command_hint(args: argparse.Namespace, input_path: Path, start_s: float) ->
     parts = ["python3 -m robot36_decode", f'"{input_path}"']
     if args.format != "wav":
         parts.append(f"--format {args.format}")
+    if args.raw_format is not None:
+        parts.append(f"--raw-format {args.raw_format}")
     if args.raw_sample_rate != 48000:
         parts.append(f"--raw-sample-rate {args.raw_sample_rate}")
     if args.invert_iq:
@@ -353,7 +354,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="(directory input) skip files whose output PNG already exists",
+        help=(
+            "(directory input) skip files whose output PNG (or a rescued "
+            "<name>_forced.png) already exists"
+        ),
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "(directory input) decode N files at the same time; 0 uses every "
+            "CPU core. Each job needs about 0.6 GB of memory per 2 minutes of "
+            "78 kHz capture"
+        ),
     )
     parser.add_argument(
         "--format",
@@ -419,6 +435,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--raw-format",
+        choices=["f32", "s16"],
+        default=None,
+        help=(
+            "sample type of headerless I/Q data (.iq/.raw, or a WAV whose header "
+            "is damaged): f32 = 32-bit float (default), s16 = 16-bit integer, as "
+            "SDR# and SDR++ record. With s16, .wav files without a WAV header in a "
+            "folder are decoded as raw instead of skipped; give --raw-sample-rate too"
+        ),
+    )
+    parser.add_argument(
         "--invert-iq",
         action="store_true",
         help="conjugate the I/Q samples (inverted-spectrum captures); iq/fm formats only",
@@ -432,6 +459,60 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _late_vis(
+    audio: WavData | IQData,
+    tone_offset_hz: float,
+    energy_start_ms: float,
+    phase_track: np.ndarray | None,
+) -> VisInfo | None:
+    """Look for a VIS header beyond the first ``VIS_SEARCH_MS`` of a long recording.
+
+    ``detect_vis`` only searches the start of the audio. A recording of a
+    whole pass can have a minute of noise before the transmission, so search
+    again just before where the signal energy starts and just before where
+    the sync pulse train starts. Only a clean Robot 36 header (right code,
+    parity OK) is accepted here, since a wrong one would misplace the image.
+    """
+    duration_ms = audio.duration_ms
+    if duration_ms <= VIS_SEARCH_MS:
+        return None
+    anchors: list[float] = []
+    if energy_start_ms > 0.0:
+        anchors.append(energy_start_ms - 2000.0)
+    provisional = track_line_starts(
+        audio.samples, audio.sample_rate, tone_offset_hz=tone_offset_hz, phase_track=phase_track
+    )
+    if provisional is not None:
+        # The header ends at line 0; leave room for a mis-numbered track.
+        anchors.append(float(provisional.line_starts_ms[0]) - 0.5 * VIS_SEARCH_MS)
+    searched: list[float] = []
+    for anchor in anchors:
+        start_ms = max(0.0, anchor)
+        if start_ms < VIS_SEARCH_MS - 2000.0:
+            continue  # already covered by the first search
+        if any(abs(start_ms - done) < 2000.0 for done in searched):
+            continue
+        searched.append(start_ms)
+        first = int(start_ms * audio.sample_rate / 1000.0)
+        if first >= audio.samples.size:
+            continue
+        found = detect_vis(
+            audio.samples[first:],
+            audio.sample_rate,
+            tone_offset_hz=tone_offset_hz,
+            phase_track=None if phase_track is None else phase_track[first:],
+        )
+        if found is not None and found.code == ROBOT36_VIS_CODE and found.parity_ok:
+            shift = first * 1000.0 / audio.sample_rate
+            return VisInfo(
+                code=found.code,
+                image_start_ms=found.image_start_ms + shift,
+                start_bit_ms=found.start_bit_ms + shift,
+                parity_ok=found.parity_ok,
+            )
+    return None
+
+
 def _locate_image(
     audio: WavData | IQData,
     args: argparse.Namespace,
@@ -440,8 +521,14 @@ def _locate_image(
     use_energy_start: bool = False,
     phase_track: np.ndarray | None = None,
     end_hint_ms: float | None = None,
+    train_start=None,
 ) -> tuple[float, float, VisInfo | None, SyncTrack | None, str]:
     """Work out where the image starts and ends.
+
+    ``end_hint_ms`` (FM captures) is where the image should end if the carrier
+    stopped with the transmission. ``train_start`` is an optional callable
+    (see :func:`_line_numbering_hint`) asked only when there is no readable
+    VIS header; its answer, when it has one, numbers the lines instead.
 
     Returns (first_line_ms, end_ms, vis, track, start_source).
     """
@@ -455,7 +542,7 @@ def _locate_image(
     elif args.no_vis:
         vis = None
         if end_hint_ms is not None:
-            nominal_start = max(0.0, end_hint_ms - IMAGE_MS)
+            nominal_start = end_hint_ms - IMAGE_MS
             start_source = "end of signal (no VIS)"
         else:
             nominal_start = 0.0
@@ -468,6 +555,8 @@ def _locate_image(
             tone_offset_hz=tone_offset_hz,
             phase_track=phase_track,
         )
+        if vis is None and end_hint_ms is None:
+            vis = _late_vis(audio, tone_offset_hz, energy_start_ms, phase_track)
         parity_failed = vis is not None and vis.parity_ok is False
         if vis is not None:
             # A header that fails its parity check cannot be trusted for the
@@ -483,11 +572,24 @@ def _locate_image(
             expected_start = nominal_start
             start_source = "VIS header"
         elif end_hint_ms is not None:
-            # Weak signal without a readable header: the end of the carrier
-            # tells the tracker which line is line 0.
-            nominal_start = max(0.0, end_hint_ms - IMAGE_MS)
-            expected_start = None
-            start_source = "end of signal (no VIS found)"
+            # No readable header. Usually the end of the carrier tells the
+            # tracker which line is line 0 (the transmission ends with the
+            # image). A signal that fades out early is numbered from where its
+            # pulse train begins instead (see _decode_file).
+            numbering = train_start() if train_start is not None else None
+            if numbering is not None and numbering[0] == "start":
+                nominal_start = numbering[1]
+                expected_start = numbering[1]
+                start_source = "start of the sync pulse train (no VIS found)"
+            elif numbering is not None:
+                end_hint_ms = numbering[1]
+                nominal_start = end_hint_ms - IMAGE_MS
+                expected_start = None
+                start_source = "end of the sync pulse train (no VIS found)"
+            else:
+                nominal_start = end_hint_ms - IMAGE_MS
+                expected_start = None
+                start_source = "end of signal (no VIS found)"
         elif use_energy_start and energy_start_ms > 0.0:
             # No VIS header: seed the sync tracker with the energy-located
             # signal start so the tracker refines from a real signal position
@@ -503,6 +605,7 @@ def _locate_image(
             start_source = "VIS timing (parity check failed)"
 
     track: SyncTrack | None = None
+    rejected = False
     if not args.no_sync:
         track = track_line_starts(
             audio.samples,
@@ -512,6 +615,15 @@ def _locate_image(
             phase_track=phase_track,
             expected_end_ms=end_hint_ms if expected_start is None else None,
         )
+        if (
+            track is not None
+            and end_hint_ms is not None
+            and abs(track.tone_offset_hz) > MAX_FM_TONE_OFFSET_HZ
+        ):
+            # FM-demodulated audio has no Doppler: a "sync tone" this far off
+            # 1200 Hz is picture content or interference, not line sync.
+            track = None
+            rejected = True
 
     if track is not None:
         first_line = float(track.line_starts_ms[0])
@@ -521,7 +633,11 @@ def _locate_image(
         first_line = nominal_start
         end_ms = nominal_start + IMAGE_MS
         if not args.no_sync:
-            start_source = f"{start_source}; sync tracking failed"
+            start_source = (
+                f"{start_source}; sync tracking rejected (locked off the sync tone)"
+                if rejected
+                else f"{start_source}; sync tracking failed"
+            )
 
     return first_line, end_ms, vis, track, start_source
 
@@ -552,6 +668,142 @@ class _PhaseCache:
         return self._items[key]
 
 
+# Sample rates sound cards and audio programs record at. A stereo WAV at any
+# other rate (SDR# writes e.g. 78125 Hz) is almost certainly an I/Q capture.
+AUDIO_RATES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000, 176400, 192000)
+
+
+def _iq_hint(audio: WavData | IQData | None, args: argparse.Namespace) -> str | None:
+    """A hint when a file read as plain audio looks like an SDR I/Q capture."""
+    if args.format != "wav" or not isinstance(audio, WavData) or audio.channels != 2:
+        return None
+    rate = audio.source_rate
+    if rate is None or rate in AUDIO_RATES:
+        return None
+    return (
+        f"this WAV has 2 channels at {rate} Hz, which looks like an SDR I/Q "
+        "recording rather than audio; for a satellite FM downlink (e.g. the ISS) "
+        "use --format fm, for SSB-style I/Q use --format iq"
+    )
+
+
+# A partial picture needs at least this many lines with audio to be worth writing.
+MIN_PARTIAL_LINES = 20
+# The ISS carrier stays on at least this long after the last picture line.
+END_TAIL_MIN_MS = 850.0
+# Lines more than this far outside the located carrier are greyed (FM).
+CARRIER_EDGE_MS = 300.0
+# Plausibility of a decode without a VIS header (see _implausible_picture).
+MAX_FM_TONE_OFFSET_HZ = 60.0
+MIN_TRACKED_FRACTION = 0.35
+MAX_SEPARATOR_MISMATCH_FRACTION = 0.40
+
+
+def _line_numbering_hint(fm: FmAudio, phases):
+    """For an FM capture without a VIS header: a callable that says how to
+    number the lines, as ``("end", ms)`` (the last line ends at ``ms``),
+    ``("start", ms)`` (line 0 starts at ``ms``) or None (no evidence).
+
+    The ISS keeps its carrier on for about a second after the last picture
+    line (0.9-1.8 s in real passes), with no sync pulses. When the capture
+    shows that quiet tail, the transmission ended inside it and the last sync
+    pulse marks the end of line 239 (more precisely than the carrier's end).
+    When the pulses run right up to where the carrier fades, the end of the
+    picture is missing, and line 0 is found from where the pulse train begins
+    (with the header pattern before it, see :mod:`.findstart`).
+    """
+    cache: dict[str, tuple[str, float] | None] = {}
+
+    def hint() -> tuple[str, float] | None:
+        if "value" in cache:
+            return cache["value"]
+        value = None
+        track = track_line_starts(fm.audio, fm.sample_rate, phase_track=phases.get(0.0))
+        last = _last_dense_line(track)
+        if last is not None:
+            last_end_ms = float(track.line_starts_ms[last]) + LINE_MS * track.line_scale
+            carrier_end_ms = (fm.signal_end_s - fm.t0_s) * 1000.0
+            if carrier_end_ms - last_end_ms >= END_TAIL_MIN_MS:
+                value = ("end", last_end_ms)
+            else:
+                estimate = find_start(fm.audio, fm.sample_rate, fm.t0_s, fm.signal_start_s, None)
+                if estimate.start_s is not None and estimate.confidence in ("HIGH", "MEDIUM"):
+                    value = ("start", (estimate.start_s - fm.t0_s) * 1000.0)
+        cache["value"] = value
+        return value
+
+    return hint
+
+
+def _last_dense_line(track: SyncTrack | None, window: int = 8, needed: int = 4) -> int | None:
+    """The last line of the pulse train that is followed by no gap: a line
+    whose ``window`` lines up to it hold at least ``needed`` detected pulses.
+    (Noise after the carrier can produce the odd stray match on the grid.)"""
+    if track is None or track.matched_idx is None or not len(track.matched_idx):
+        return None
+    matched = np.zeros(LINES + window, dtype=int)
+    idx = np.asarray(track.matched_idx, dtype=int)
+    matched[idx[(idx >= 0) & (idx < LINES)] + window] = 1
+    counts = np.convolve(matched, np.ones(window, dtype=int), mode="full")[window : LINES + window]
+    dense = np.flatnonzero((counts >= needed) & (matched[window:] == 1))
+    return int(dense[-1]) if dense.size else None
+
+
+def _implausible_picture(
+    track: SyncTrack | None,
+    stats,
+    line_valid: np.ndarray,
+    fm_audio: bool,
+    header: bool = False,
+) -> str | None:
+    """Why a decode is not a Robot 36 picture, or None.
+
+    Without a header nothing confirms the mode, and on a carrier that holds no
+    Robot 36 (voice, another mode, noise) the sync tracker can still lock onto
+    something periodic. Such a "picture" is noise, so it is refused. With a
+    header but no usable line sync, only the colour separators are checked:
+    the header proves the mode, not that a picture followed it.
+    """
+    recorded = int(np.count_nonzero(line_valid))
+    partial = recorded < LINES
+    if header:
+        return _separator_problem(stats)
+    if track is None:
+        # Fixed 150 ms lines are only trusted for a complete recording.
+        return "no line sync pulses found in a partial recording" if partial else None
+    if fm_audio and abs(track.tone_offset_hz) > MAX_FM_TONE_OFFSET_HZ:
+        # FM demodulation removes Doppler: the tones of demodulated audio are
+        # where they belong, so a far-off "sync tone" is something else.
+        return (
+            f"the line sync is {track.tone_offset_hz:+.0f} Hz off the 1200 Hz sync tone, "
+            "which demodulated FM audio cannot be"
+        )
+    matched = 0
+    if track.matched_idx is not None:
+        idx = np.asarray(track.matched_idx, dtype=int)
+        idx = idx[(idx >= 0) & (idx < LINES)]
+        matched = int(np.count_nonzero(line_valid[idx]))
+    if recorded and matched < MIN_TRACKED_FRACTION * recorded:
+        return f"only {matched} of {recorded} lines show a sync pulse"
+    if fm_audio:
+        # Sync pulses on the 1200 Hz tone are the stronger evidence. In heavy
+        # FM noise the short separator tones read low (odd lines look even),
+        # so a real but very noisy picture can fail the separator test.
+        return None
+    return _separator_problem(stats)
+
+
+def _separator_problem(stats) -> str | None:
+    if stats.checked_lines >= MIN_PARTIAL_LINES and (
+        stats.separator_mismatches > MAX_SEPARATOR_MISMATCH_FRACTION * stats.checked_lines
+    ):
+        return (
+            f"{stats.separator_mismatches} of {stats.checked_lines} colour separators are "
+            "out of order (a Robot 36 picture alternates them; noise gets about half wrong)"
+        )
+    return None
+
+
 def _decode_file(
     args: argparse.Namespace,
     input_path: Path,
@@ -565,6 +817,7 @@ def _decode_file(
     ``force_start`` (seconds) overrides ``--force-start``; ``--force-start
     auto`` is resolved here with :func:`_estimate_start`.
     """
+    audio: WavData | IQData | None = None
     try:
         if force_start is None:
             force_start = args.force_start
@@ -581,7 +834,7 @@ def _decode_file(
             force_start = estimate.start_s
         fm: FmAudio | None = None
         if args.format == "fm":
-            native = read_iq(input_path, raw_sample_rate=args.raw_sample_rate, target_rate=None)
+            native = read_iq(input_path, raw_sample_rate=args.raw_sample_rate, target_rate=None, raw_format=args.raw_format or "f32")
             samples = np.conj(native.samples) if args.invert_iq else native.samples
             _check_capture_length(samples, native.sample_rate)
             if force_start is not None:
@@ -625,7 +878,7 @@ def _decode_file(
             if save_audio is not None:
                 write_audio_wav(save_audio, fm.audio, fm.sample_rate)
         elif args.format == "iq":
-            audio = read_iq(input_path, raw_sample_rate=args.raw_sample_rate)
+            audio = read_iq(input_path, raw_sample_rate=args.raw_sample_rate, raw_format=args.raw_format or "f32")
             if args.invert_iq:
                 audio.samples = np.conj(audio.samples)
         else:
@@ -648,15 +901,19 @@ def _decode_file(
             # found. The tone (Doppler) offset is NOT taken from the spectrum --
             # the dominant bin depends on picture content -- but measured from the
             # sync pulses by the tracker.
+            # (FM captures are already trimmed to the located carrier, and their
+            # end-of-signal hint takes precedence, so they skip this search.)
             energy_start_ms = 0.0
-            if audio.samples.size:
+            if audio.samples.size and fm is None:
                 energy_start_ms, _sig_end_ms, _centre_hz = locate_signal(
                     audio.samples, audio.sample_rate
                 )
 
             end_hint_ms = None
+            train_start = None
             if fm is not None:
                 end_hint_ms = (fm.signal_end_s - fm.t0_s) * 1000.0 - FM_TAIL_MS
+                train_start = _line_numbering_hint(fm, phases)
             min_matched_lines = max(4, int(LINES * 0.5))
 
             first_line, end_ms, vis, track, start_source = _locate_image(
@@ -667,6 +924,7 @@ def _decode_file(
                 use_energy_start=False,
                 phase_track=phases.get(0.0),
                 end_hint_ms=end_hint_ms,
+                train_start=train_start,
             )
             used_tone_offset_hz = 0.0
             used_band_span = (0.0, 0.0)
@@ -699,6 +957,7 @@ def _decode_file(
                         use_energy_start=True,
                         phase_track=phases.get(estimate, span),
                         end_hint_ms=end_hint_ms,
+                        train_start=train_start,
                     )
                     retry_track = retry[3]
                     # Keep whichever pass tracked more lines.
@@ -713,44 +972,70 @@ def _decode_file(
 
         start_sample = int(round(first_line * audio.sample_rate / 1000.0))
         required_samples = int(round((end_ms - first_line) * audio.sample_rate / 1000.0))
-        if start_sample < 0 or start_sample >= audio.samples.size:
+        line_samples = LINE_MS * audio.sample_rate / 1000.0
+        # The image may have begun before the recording (or before a dropout),
+        # and may end after it: those lines have no audio and are grey.
+        lead_missing = max(0, -start_sample)
+        if start_sample >= audio.samples.size or lead_missing >= required_samples:
+            where = "beyond the end" if start_sample >= 0 else "entirely before the start"
             raise ValueError(
-                f"image start ({_human_time(first_line)}) is beyond the end "
-                f"of the audio ({_human_time(audio.duration_ms)})"
+                f"the located image ({_human_time(first_line)} - {_human_time(end_ms)}) lies "
+                f"{where} of the audio ({_human_time(audio.duration_ms)})"
             )
-
-        available = audio.samples.size - start_sample
+        first_sample = start_sample + lead_missing
+        image_samples = audio.samples[first_sample : start_sample + required_samples]
+        image_phase = phases.get(used_tone_offset_hz, used_band_span)[
+            first_sample : start_sample + required_samples
+        ]
+        if lead_missing:
+            image_samples = np.pad(image_samples, (lead_missing, 0))
+            image_phase = np.pad(image_phase, (lead_missing, 0), mode="edge")
         # Allow a couple of milliseconds of rounding shortfall at the end.
         tolerance = int(round(0.002 * audio.sample_rate))
-        image_samples = audio.samples[start_sample : start_sample + required_samples]
-        image_phase = phases.get(used_tone_offset_hz, used_band_span)[
-            start_sample : start_sample + required_samples
-        ]
+        tail_missing = required_samples - image_samples.size
         valid_lines = LINES
-        if available < required_samples - tolerance:
-            need_s = (end_ms - first_line) / 1000.0
-            have_s = available / audio.sample_rate
-            if not forced:
-                raise ValueError(
-                    f"audio is too short for a Robot 36 image: need {need_s:.2f} s "
-                    f"from the image start, have {have_s:.2f} s"
-                    + (
-                        f". The signal was located at {_human_time(fm.signal_start_s * 1000)}"
-                        f" - {_human_time(fm.signal_end_s * 1000)} of the capture; "
-                        "--find-start reports where the image starts, and --force-start auto "
-                        "decodes from there"
-                        if fm is not None
-                        else ""
-                    )
+        if tail_missing > tolerance:
+            valid_lines = min(LINES, int((image_samples.size) // line_samples))
+        if tail_missing > 0:
+            image_samples = np.pad(image_samples, (0, tail_missing))
+            image_phase = np.pad(image_phase, (0, tail_missing), mode="edge")
+        missing_top = min(LINES, int(np.ceil(lead_missing / line_samples))) if lead_missing else 0
+        if fm is not None and not forced:
+            # The demodulated audio runs a little past both ends of the
+            # carrier; lines entirely outside the carrier are just noise.
+            carrier_from = (fm.signal_start_s - fm.t0_s) * 1000.0 - CARRIER_EDGE_MS
+            carrier_to = (fm.signal_end_s - fm.t0_s) * 1000.0 + CARRIER_EDGE_MS
+            if carrier_from > first_line:
+                missing_top = max(missing_top, min(LINES, int(np.ceil((carrier_from - first_line) / LINE_MS))))
+            valid_lines = max(0, min(valid_lines, int((carrier_to - first_line) // LINE_MS)))
+        recorded_lines = max(0, valid_lines - missing_top)
+        if not forced and recorded_lines < MIN_PARTIAL_LINES:
+            raise ValueError(
+                f"only {recorded_lines} of the {LINES} image lines are in the audio "
+                f"(the image is located at {_human_time(first_line)} - {_human_time(end_ms)}, "
+                f"the audio is {_human_time(audio.duration_ms)} long)"
+                + (
+                    f". The signal was located at {_human_time(fm.signal_start_s * 1000)}"
+                    f" - {_human_time(fm.signal_end_s * 1000)} of the capture; "
+                    "--find-start reports where the image starts, and --force-start auto "
+                    "decodes from there"
+                    if fm is not None
+                    else ""
                 )
-            # Forced decode of a truncated file: pad with silence and grey out
-            # the lines that have no audio.
-            missing = required_samples - image_samples.size
-            image_samples = np.pad(image_samples, (0, missing))
-            image_phase = np.pad(image_phase, (0, missing), mode="edge")
-            valid_lines = int(image_samples.size - missing) * 1000 // int(
-                round(LINE_MS * audio.sample_rate)
             )
+        line_valid = np.zeros(LINES, dtype=bool)
+        line_valid[missing_top:valid_lines] = True
+        # Lines inside a receiver dropout carry no picture: grey them too.
+        dropout_lines = np.zeros(LINES, dtype=bool)
+        if fm is not None and fm.dropouts_s:
+            if track is not None:
+                line_begin = np.asarray(track.line_starts_ms, dtype=np.float64)
+            else:
+                line_begin = first_line + np.arange(LINES) * LINE_MS
+            for a_s, b_s in fm.dropouts_s:
+                a_ms, b_ms = (a_s - fm.t0_s) * 1000.0, (b_s - fm.t0_s) * 1000.0
+                dropout_lines |= (line_begin < b_ms) & (line_begin + LINE_MS > a_ms)
+            line_valid &= ~dropout_lines
         relative_starts = None
         line_offsets = None
         if track is not None:
@@ -767,16 +1052,29 @@ def _decode_file(
             line_offsets_hz=line_offsets,
             phase_track=image_phase,
             repair_lines=args.repair_lines,
+            line_valid=line_valid,
         )
+        if not forced and (vis is None or track is None):
+            problem = _implausible_picture(
+                track, stats, line_valid, fm is not None, header=vis is not None
+            )
+            if problem is not None:
+                raise ValueError(f"no Robot 36 picture found: {problem}")
         if valid_lines < LINES:
             rgb[valid_lines:] = 128
+        if missing_top:
+            rgb[:missing_top] = 128
+        rgb[dropout_lines] = 128
         write_png(
             output_path,
             rgb,
             scale=args.scale,
-            title=f"robot36-decode v{__version__} (automatic analysis band-limiting, zero taper)",
+            title=f"robot36-decode v{__version__}",
         )
 
+        hint = _iq_hint(audio, args)
+        if hint is not None:
+            print(f"warning: {input_path}: {hint}", file=sys.stderr)
         if not args.quiet:
             channel_text = "mono" if audio.channels == 1 else f"{audio.channels} ch"
             print(f"Input:  {input_path}")
@@ -819,17 +1117,27 @@ def _decode_file(
             else:
                 print("Sync:   not tracked; using fixed 150 ms lines")
             print(f"Start:  {_human_time(first_line)} ({start_source})")
+            if missing_top:
+                print(
+                    f"Note:   the recording starts {missing_top} lines into the image; "
+                    "those lines are grey."
+                )
             if valid_lines < LINES:
                 print(
-                    f"Note:   the file ends after {valid_lines} of {LINES} lines; "
+                    f"Note:   the recording ends after line {valid_lines} of {LINES}; "
                     "the remaining lines are grey."
+                )
+            if dropout_lines.any():
+                print(
+                    f"Note:   {int(np.count_nonzero(dropout_lines))} lines fall in a receiver "
+                    "dropout (no signal recorded); they are grey."
                 )
             if stats.repaired_lines:
                 print(f"Repair: {stats.repaired_lines} line(s) interpolated from neighbours")
             if stats.separator_mismatches:
                 print(
-                    f"Note:   {stats.separator_mismatches} line separator(s) did "
-                    "not match the expected alternating colour order."
+                    f"Note:   {stats.separator_mismatches} of {stats.checked_lines} line "
+                    "separators did not match the expected alternating colour order."
                 )
             print("Decoded: 320x240 RGB")
             print(f"Output: {output_path}")
@@ -837,6 +1145,9 @@ def _decode_file(
 
     except Exception as exc:  # noqa: BLE001 - reported per file, see _describe_error
         message = _describe_error(exc)
+        hint = _iq_hint(audio, args)
+        if hint is not None:
+            message = f"{message}. Note: {hint}"
         print(f"error: {message}", file=sys.stderr)
         if error_sink is not None:
             error_sink.append(message)
@@ -877,6 +1188,27 @@ def _looks_like_wave(path: Path) -> bool:
     except OSError:
         return False
     return len(head) == 12 and head[:4] in (b"RIFF", b"RF64") and head[8:12] == b"WAVE"
+
+
+def _not_wave_reason(path: Path, formats: str) -> str:
+    """Why a .wav file is skipped, with a hint when it looks like a recording
+    whose WAV header was overwritten (SDR software that crashed or was killed
+    can leave the start of the file filled with 0xFF bytes)."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(1 << 20)
+    except OSError as exc:
+        return f"cannot read ({exc})"
+    if not head:
+        return "empty file"
+    fill = len(head) - len(head.lstrip(b"\xff"))
+    if fill >= 64 and formats in ("iq", "fm"):
+        return (
+            f"no WAV header (the file starts with {fill if fill < len(head) else 'over 1 MB of'} "
+            "0xFF bytes); if it is an SDR recording, decode it as headerless data: "
+            "--raw-format s16 --raw-sample-rate <your SDR rate, e.g. 78125>"
+        )
+    return "not a valid WAV file"
 
 
 def _batch_targets(
@@ -933,6 +1265,40 @@ def _rescue(
     return f"{target}  (forced start {estimate.start_s:.4f} s, {estimate.confidence} confidence)"
 
 
+def _process_file(
+    args: argparse.Namespace,
+    path: Path,
+    output: Path,
+    save_audio: Path | None,
+    capture: bool = False,
+) -> tuple[str, str, str]:
+    """Decode one file of a directory run, rescuing it if that fails.
+
+    Returns ``(status, detail, text)``. With ``capture`` (parallel jobs) the
+    messages are collected and returned as ``text`` instead of printed, so the
+    output of files decoded at the same time does not interleave; in quiet
+    mode only the error messages are kept.
+    """
+    import contextlib
+    import io
+
+    buffer = io.StringIO()
+    out = contextlib.redirect_stdout(buffer) if capture and not args.quiet else contextlib.nullcontext()
+    err = contextlib.redirect_stderr(buffer) if capture else contextlib.nullcontext()
+    with out, err:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if save_audio is not None:
+            save_audio.parent.mkdir(parents=True, exist_ok=True)
+        errors: list[str] = []
+        if _decode_file(args, path, output, save_audio, errors) == 0:
+            status, detail = "ok", str(output)
+        else:
+            reason = errors[0] if errors else "decode failed"
+            rescued = None if args.no_rescue else _rescue(args, path, output, save_audio)
+            status, detail = ("rescued", rescued) if rescued is not None else ("FAILED", reason)
+    return status, detail, buffer.getvalue()
+
+
 def _run_directory(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Decode every valid input file in ``args.input`` (a directory)."""
     root: Path = args.input
@@ -955,8 +1321,8 @@ def _run_directory(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     skipped: list[tuple[Path, str]] = []
     inputs: list[Path] = []
     for path in candidates:
-        if path.suffix.lower() == ".wav" and not _looks_like_wave(path):
-            skipped.append((path, "not a valid WAV file"))
+        if path.suffix.lower() == ".wav" and not _looks_like_wave(path) and args.raw_format is None:
+            skipped.append((path, _not_wave_reason(path, args.format)))
         else:
             inputs.append(path)
 
@@ -972,31 +1338,58 @@ def _run_directory(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
 
     results: list[tuple[Path, str, str]] = []  # (path, status, detail)
     already_done = 0
+    todo: list[Path] = []
     for path in inputs:
-        if args.skip_existing and outputs[path].exists():
+        forced = outputs[path].with_name(f"{outputs[path].stem}_forced.png")
+        if args.skip_existing and (outputs[path].exists() or forced.exists()):
             already_done += 1
             results.append((path, "skipped", "output exists"))
-            continue
-        index = len(results) + 1 + len(skipped)
-        if not args.quiet:
-            print(f"[{index}/{len(candidates)}] {path}")
-        outputs[path].parent.mkdir(parents=True, exist_ok=True)
-        save_audio = audio_outputs.get(path)
-        if save_audio is not None:
-            save_audio.parent.mkdir(parents=True, exist_ok=True)
-        errors: list[str] = []
-        status = _decode_file(args, path, outputs[path], save_audio, errors)
-        if status == 0:
-            results.append((path, "ok", str(outputs[path])))
         else:
-            reason = errors[0] if errors else "decode failed"
-            rescued = None if args.no_rescue else _rescue(args, path, outputs[path], save_audio)
-            if rescued is not None:
-                results.append((path, "rescued", rescued))
-            else:
-                results.append((path, "FAILED", reason))
+            todo.append(path)
+
+    jobs = args.jobs if args.jobs > 0 else (os.cpu_count() or 1)
+    jobs = max(1, min(jobs, len(todo)))
+    work = [(args, path, outputs[path], audio_outputs.get(path)) for path in todo]
+    numbered = {path: len(skipped) + already_done + n + 1 for n, path in enumerate(todo)}
+    if jobs == 1:
+        for item in work:
+            path = item[1]
+            if not args.quiet:
+                print(f"[{numbered[path]}/{len(candidates)}] {path}")
+            status, detail, _ = _process_file(*item)
+            results.append((path, status, detail))
+            if not args.quiet:
+                print()
+    else:
+        import concurrent.futures
+        import multiprocessing
+
         if not args.quiet:
+            print(f"Decoding {len(todo)} file(s), {jobs} at a time")
             print()
+        context = multiprocessing.get_context("spawn")  # same behaviour on every OS
+        with concurrent.futures.ProcessPoolExecutor(jobs, mp_context=context) as pool:
+            futures = {pool.submit(_process_file, *item, True): item[1] for item in work}
+            for future in concurrent.futures.as_completed(futures):
+                path = futures[future]
+                try:
+                    status, detail, text = future.result()
+                except concurrent.futures.process.BrokenProcessPool:
+                    status, text = "FAILED", ""
+                    detail = (
+                        "a decoding process stopped unexpectedly (out of memory?); "
+                        "try fewer --jobs"
+                    )
+                except Exception as exc:  # noqa: BLE001 - a crashed worker must not stop the batch
+                    status, detail, text = "FAILED", _describe_error(exc), ""
+                results.append((path, status, detail))
+                if not args.quiet:
+                    print(f"[{numbered[path]}/{len(candidates)}] {path}")
+                    if text:
+                        print(text.rstrip("\n"))
+                    print()
+                elif text:
+                    print(text.rstrip("\n"), file=sys.stderr)
 
     for path, reason in skipped:
         results.append((path, "skipped", reason))
@@ -1028,10 +1421,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--scale must be at least 1")
     if args.invert_iq and args.format == "wav":
         parser.error("--invert-iq requires --format iq or fm")
+    if args.raw_format is not None and args.format == "wav":
+        parser.error("--raw-format requires --format iq or fm")
     if (args.fm_bandwidth is not None and args.fm_bandwidth <= 0) or args.signal_seconds <= 0:
         parser.error("--fm-bandwidth and --signal-seconds must be positive")
     if args.raw_sample_rate < 1:
         parser.error("--raw-sample-rate must be positive")
+    if args.jobs < 0:
+        parser.error("--jobs cannot be negative (0 means one job per CPU core)")
     if args.find_start and args.force_start is not None:
         parser.error("--find-start and --force-start cannot be combined")
     if args.find_start and (args.start_ms is not None):
@@ -1051,7 +1448,7 @@ def main(argv: list[str] | None = None) -> int:
             files = [
                 path
                 for path in _candidate_files(args.input, args.format, args.recursive)
-                if path.suffix.lower() != ".wav" or _looks_like_wave(path)
+                if path.suffix.lower() != ".wav" or _looks_like_wave(path) or args.raw_format is not None
             ]
         else:
             files = [args.input]
@@ -1060,8 +1457,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.input.is_dir():
         return _run_directory(args, parser)
 
-    if args.recursive or args.skip_existing:
-        parser.error("--recursive and --skip-existing only apply when the input is a directory")
+    if args.recursive or args.skip_existing or args.jobs != 1:
+        parser.error(
+            "--recursive, --skip-existing and --jobs only apply when the input is a directory"
+        )
+    if args.save_audio is not None and args.format != "fm":
+        parser.error("--save-audio requires --format fm")
     try:
         output_path = _resolve_single_target(
             args.output, args.output_dir_hint, args.input, ".png"
