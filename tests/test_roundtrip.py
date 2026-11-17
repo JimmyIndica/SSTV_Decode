@@ -1139,6 +1139,61 @@ def test_headerless_16bit_capture():
     assert _run_cli(str(d / "damaged.wav"), "--raw-format", "s16")[0] == 2, "needs --format iq/fm"
 
 
+def test_fm_strong_signal_is_not_mistaken_for_dropouts():
+    """v3.5.1: with a strong signal (25 dB and up) v3.5.0 took the plain noise
+    before and after it for receiver dropouts and located the wrong stretch."""
+    from robot36_decode import fmdemod
+
+    sig = _signal()
+    img0 = sig["image_start_ms"] / 1000.0
+    for snr in (40.0, 60.0):
+        iq = _fm_capture(sig, inband_snr_db=snr)
+        location = fmdemod.locate_fm_signal(iq, FM_FS)
+        assert location is not None and not location.dropouts_s, (snr, location)
+        assert location.start_s < 5.0 + img0 and location.end_s > 5.0 + img0 + 36.0, (snr, location.start_s, location.end_s)
+    d = _tmp()
+    synth.write_raw_iq(d / "strong.raw", _fm_capture(sig, inband_snr_db=40.0))
+    rc, out, err = _run_cli(str(d / "strong.raw"), "--format", "fm", "--raw-sample-rate", "78125")
+    assert rc == 0 and "receiver dropout" not in out, (out, err)
+    mae = _mae_of(d / "strong.png", sig)
+    RESULTS.append(("fm, strong signal (40 dB)", "ok" if mae <= 6.0 else "FAIL", mae, 6.0))
+    assert mae <= 6.0, mae
+    # real dropouts are still found next to a strong signal
+    iq = _fm_capture(sig, dead_before_s=15.0, inband_snr_db=40.0)
+    d0 = int((15.0 + img0 + 15.0) * FM_FS)
+    iq[d0 : d0 + 6 * FM_FS] *= 1e-3
+    location = fmdemod.locate_fm_signal(iq, FM_FS)
+    assert len(location.dropouts_s) == 1 and abs(location.dropouts_s[0][0] - (15.0 + img0 + 15.0)) < 0.5, location.dropouts_s
+    assert location.end_s > 15.0 + img0 + 36.0, location.end_s
+
+
+def test_one_command_name_everywhere():
+    """v3.5.2: help, version and hints say robot36_decode, as the command was run."""
+    import subprocess
+
+    root = str(Path(__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": root}
+    run = lambda *a: subprocess.run([sys.executable, "-m", "robot36_decode", *a], capture_output=True, text=True, env=env)
+    launcher = "py" if sys.platform == "win32" else "python3"
+    help_text = run("--help").stdout
+    assert help_text.startswith(f"usage: {launcher} -m robot36_decode "), help_text[:80]
+    assert "robot36-decode" not in help_text
+    assert run("--version").stdout.strip().startswith("robot36_decode ")
+    d = _tmp()
+    synth.write_wav_pcm16(d / "a.wav", synth.to_audio(_signal()), FS)
+    found = run(str(d / "a.wav"), "--find-start").stdout
+    assert f"Try:  {launcher} -m robot36_decode " in found, found
+    # as the installed command (any other argv[0]) it is plain robot36_decode
+    from robot36_decode import cli
+
+    saved = sys.argv[0]
+    try:
+        sys.argv[0] = "/usr/local/bin/robot36_decode"
+        assert cli._program_name() == "robot36_decode"
+    finally:
+        sys.argv[0] = saved
+
+
 def _run_all() -> int:
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

@@ -1,4 +1,4 @@
-# robot36-decode v3.5.0
+# robot36_decode v3.5.2
 
 A Robot 36 colour SSTV decoder for Python. It decodes:
 
@@ -47,7 +47,7 @@ There is nothing to build. Unzip the package, install the two dependencies, and 
 ### macOS / Linux (bash, zsh)
 
 ```bash
-unzip robot36_decode_v3.5.0.zip -d robot36
+unzip robot36_decode_v3.5.2.zip -d robot36
 cd robot36
 
 python3 -m venv .venv                # optional but recommended
@@ -61,7 +61,7 @@ python3 -m robot36_decode --version
 
 ```bat
 :: unzip with Explorer ("Extract All...") or:
-tar -xf robot36_decode_v3.5.0.zip -C robot36
+tar -xf robot36_decode_v3.5.2.zip -C robot36
 cd robot36
 
 py -3 -m venv .venv
@@ -74,7 +74,7 @@ py -m robot36_decode --version
 ### Windows (PowerShell)
 
 ```powershell
-Expand-Archive robot36_decode_v3.5.0.zip -DestinationPath robot36
+Expand-Archive robot36_decode_v3.5.2.zip -DestinationPath robot36
 cd robot36
 
 py -3 -m venv .venv
@@ -86,23 +86,34 @@ py -m robot36_decode --version
 
 On Windows the launcher is `py` (or `python` if it is on your PATH). On macOS/Linux use `python3`. Everywhere below, `python3 -m robot36_decode` and `py -m robot36_decode` are interchangeable.
 
-> **Run it from the folder that contains `robot36_decode/`.** To run from anywhere, either set `PYTHONPATH` to that folder (macOS/Linux: `export PYTHONPATH=/path/to/robot36`; cmd: `set PYTHONPATH=C:\path\to\robot36`; PowerShell: `$env:PYTHONPATH="C:\path\to\robot36"`), or `pip install` the folder after adding your own `pyproject.toml`.
+> **Run it from the folder that contains `robot36_decode/`.** To run from anywhere, either set `PYTHONPATH` to that folder (macOS/Linux: `export PYTHONPATH=/path/to/robot36`; cmd: `set PYTHONPATH=C:\path\to\robot36`; PowerShell: `$env:PYTHONPATH="C:\path\to\robot36"`), or install it (next section).
+
+> **One name.** Everything is called `robot36_decode`, with an underscore: the package folder, `python3 -m robot36_decode`, and the installed command. The help text and the `Try:` lines show the command the way you ran it.
 
 ### Optional: a short command name
+
+The package includes a `pyproject.toml`, so installing it gives you a `robot36_decode` command that works from any folder:
+
+```bash
+python3 -m pip install .        # Windows: py -m pip install .     (run inside the unzipped folder or the git repo)
+robot36_decode --version
+```
+
+Without installing, an alias does the same:
 
 macOS/Linux, add to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-alias robot36-decode='PYTHONPATH=$HOME/robot36 python3 -m robot36_decode'
+alias robot36_decode='PYTHONPATH=$HOME/robot36 python3 -m robot36_decode'
 ```
 
 Windows PowerShell, add to your `$PROFILE`:
 
 ```powershell
-function robot36-decode { $env:PYTHONPATH="$HOME\robot36"; py -m robot36_decode @args }
+function robot36_decode { $env:PYTHONPATH="$HOME\robot36"; py -m robot36_decode @args }
 ```
 
-Windows cmd: create `robot36-decode.bat` somewhere on your PATH containing
+Windows cmd: create `robot36_decode.bat` somewhere on your PATH containing
 `@set PYTHONPATH=C:\path\to\robot36 && py -m robot36_decode %*`.
 
 ---
@@ -155,7 +166,7 @@ For recordings of an FM carrier. Works with stereo I/Q WAV (including large `RF6
 Real passes are often incomplete, and the decoder copes with that:
 
 * **Partial pictures.** A recording that starts after the picture began, or a signal that fades out or stops before it ends, gives the lines that were received in their right place; the rest are grey. With a VIS header, the header places the picture. Without one, the ISS's habit of keeping its carrier on for about a second after the last line tells which end is missing: if that quiet tail is in the capture, the lines are counted back from the last sync pulse; if the pulses run until the carrier fades, they are counted from where the pulse train begins.
-* **Receiver dropouts.** Stretches where the SDR delivered near-silence (seconds at 20-30 dB below the noise) are neither mistaken for the signal nor allowed to split it; the lines that fall in one are grey.
+* **Receiver dropouts.** Stretches where the SDR delivered digital near-silence (far more than 30 dB below the noise floor) are neither mistaken for the signal nor allowed to split it; the lines that fall in one are grey.
 * **Not every carrier is a picture.** Without a VIS header, a decode must look like Robot 36 (sync pulses on most lines, at the 1200 Hz sync tone, colour separators alternating) or the file is reported as `no Robot 36 picture found` instead of being written as a picture of noise.
 * **Damaged headers.** A recording whose WAV header was overwritten (the file starts with 0xFF bytes) can be decoded as headerless data with `--raw-format s16 --raw-sample-rate <rate>`.
 
@@ -164,7 +175,7 @@ Real passes are often incomplete, and the decoder copes with that:
 ## 4. Command-line reference
 
 ```
-robot36-decode [-h] [-o OUTPUT] [--start-ms MS] [--no-vis] [--no-sync]
+python3 -m robot36_decode [-h] [-o OUTPUT] [--start-ms MS] [--no-vis] [--no-sync]
                [--force-start SECONDS|auto] [--find-start]
                [--black-hz HZ] [--white-hz HZ] [--scale N] [--quiet]
                [-r] [--skip-existing] [--no-rescue] [-j N]
@@ -187,7 +198,7 @@ Invoke it as `python3 -m robot36_decode ...` (macOS/Linux) or `py -m robot36_dec
 | Option | Default | Description |
 |---|---|---|
 | `-h`, `--help` | | Show the help text and exit. |
-| `--version` | | Print the version (`robot36-decode 3.5.0`) and exit. |
+| `--version` | | Print the version (`robot36_decode 3.5.2`) and exit. |
 | `-o OUTPUT`, `--output OUTPUT` | input name with `.png` | Output PNG path. An existing file is overwritten. The parent folder must exist. **A path ending in a slash (`out/`), or an existing directory, means a directory**: it is created if needed (including parents) and receives `<input name>.png`. With a directory input this is always the output *directory*. |
 | `--scale N` | `1` | Integer nearest-neighbour upscale of the PNG. `--scale 2` writes 640x480, `--scale 3` 960x720. Does not change the decode, only the saved file. |
 | `--quiet` | off | Print only errors. The exit status still reports success or failure. |
@@ -678,7 +689,7 @@ py -m robot36_decode capture.wav --format fm --quiet || echo decode failed
 ### 6.13 Check the version
 
 ```bash
-python3 -m robot36_decode --version      # robot36-decode 3.5.0
+python3 -m robot36_decode --version      # robot36_decode 3.5.2
 ```
 
 ---
@@ -754,7 +765,7 @@ Picture quality is limited by signal-to-noise ratio. FM demodulation has a thres
 
 ## 10. How it works
 
-1. **Locate** (`fmdemod.locate_fm_signal`): a time/frequency power map and a sliding 12 kHz band score find when the FM signal is present and where its carrier is, ignoring spurs and wideband bursts. The noise level comes from the quiet part of the capture or, for a capture trimmed close to the transmission, from the bands beside the signal. Receiver dropouts (frames 20x below the typical power) are set aside: they neither count as signal nor split a transmission.
+1. **Locate** (`fmdemod.locate_fm_signal`): a time/frequency power map and a sliding 12 kHz band score find when the FM signal is present and where its carrier is, ignoring spurs and wideband bursts. The noise level comes from the quiet part of the capture or, for a capture trimmed close to the transmission, from the bands beside the signal. Receiver dropouts (frames whose noise floor is over 30 dB below the typical one; real ones are digital near-silence) are set aside: they neither count as signal nor split a transmission.
 2. **Track the carrier**: a robust cubic polynomial through the carrier centroid track, refined twice from the discriminator's own residual mean per half second. The final curve is the Doppler shift.
 3. **Demodulate with feedback**: the carrier is mixed to 0 Hz and channel-filtered, then FM-discriminated. An annealed series of six feedback passes re-mixes the signal with its own audio estimate so that progressively narrower filters (half-bandwidth 4200 Hz down to 2400 Hz) can be used, which pushes the FM threshold lower. Spikes from phase slips ("clicks") beyond what the filter can pass are interpolated out.
 4. **Audio clean-up**: moving-average DC removal, a 1000-2500 Hz band-pass (covers VIS 1100/1300 Hz, sync 1200 Hz and picture 1500-2300 Hz), resample to 48 kHz.
@@ -768,7 +779,7 @@ Picture quality is limited by signal-to-noise ratio. FM demodulation has a thres
 
 ## 11. Tests
 
-The `tests` folder holds a synthetic Robot 36 encoder (`synth.py`) and a test runner with 85 tests: round trips for audio, I/Q (raw, WAV, mono, inverted) and FM baseband at various sample rates; Doppler tracking (offset, rate, acceleration, clock error); noise and burst robustness; VIS detection; and, when the real captures are present, quality limits on each capture.
+The `tests` folder holds a synthetic Robot 36 encoder (`synth.py`) and a test runner with 87 tests: round trips for audio, I/Q (raw, WAV, mono, inverted) and FM baseband at various sample rates; Doppler tracking (offset, rate, acceleration, clock error); noise and burst robustness; VIS detection; and, when the real captures are present, quality limits on each capture.
 
 Run from the package folder:
 
@@ -784,7 +795,7 @@ Windows:
 py tests\test_roundtrip.py
 ```
 
-The suite takes about two minutes. There is no pytest requirement; the file runs itself and prints a table of results and `85/85 tests passed`. Test files go in one temporary folder that is deleted at the end of the run (set `R36_KEEP_TMP=1` to keep it for inspection).
+The suite takes about two minutes. There is no pytest requirement; the file runs itself and prints a table of results and `87/87 tests passed`. Test files go in one temporary folder that is deleted at the end of the run (set `R36_KEEP_TMP=1` to keep it for inspection).
 
 The real-capture tests look for the capture files in the folder named by the `R36_CAPTURE_DIR` environment variable (default `/mnt/user-data/uploads`) and are skipped if it does not exist. Set it to your own folder:
 
@@ -857,6 +868,8 @@ The tuning constants for the FM stage live at the top of `fmdemod.py`; `FEEDBACK
 * **3.4.2** Fixed the green stripe on the right edge of the picture (and a milder one on the left). The last chroma pixel of every line ends exactly where the next 1200 Hz sync pulse begins, and the demodulator and 1-2.5 kHz band-pass smear that step over about half a millisecond, so the last pixel(s) were averaged with the sync tone; sync decodes as chroma zero, which is green. The last luma pixels likewise picked up the 2300 Hz separator on odd lines. Edge pixels are now measured over the nearest clean stretch of the same signal (no interpolation, no filtering, timing unchanged); the rest of the picture is bit-identical. 70 tests.
 * **3.4.3** Speed and loose ends. Decoding is about 1.8x faster (a two-minute FM capture from the command line: 4.5-5.5 s down to about 2.5 s; measured in one process, 3.1-4.8 s down to 2.1-2.9 s per capture): the decoder no longer imports `scipy.signal` (about 1 s at start-up) but uses its own FIR design, FFT convolution and polyphase resampler (`filters.py`, checked against SciPy), uses `scipy.fft` instead of `numpy.fft` (6-15x faster on the odd transform lengths of real recordings), computes the VIS tone energies with one matrix product, skips an energy search the FM path never used, and reads I/Q files without intermediate copies. Pictures differ from 3.4.2 by at most 1-2 levels in a few dozen pixels (rounding). New `-j/--jobs` decodes several files of a folder in parallel. Fixes: a VIS header more than 15 s into an audio recording is now found (the image start was 6-11 lines off); FM captures trimmed to within a few seconds of the transmission now decode (only half the signal was located); a stereo WAV at an SDR sample rate read without `--format` gets a hint to use `--format fm`; `--save-audio` without `--format fm` is an error for a single file too (was ignored); `--skip-existing` also skips files rescued earlier (`<name>_forced.png`); RF64 files take the data size from `ds64`. The tests now delete their temporary files (a full run used to leave several GB behind). The reference-image benchmark test and its JPEG (`tests/data/`) are gone, so nothing needs Pillow any more; the real-capture quality limits still check the 26OCT capture. 79 tests.
 * **3.5.0** Tested against a folder of 65 real ISS captures full of traps (empty recordings, header-only files, dropouts, damaged headers, partial passes); a folder run now gives 21 pictures (19 before, 10 of them only by rescue), all in the right place and none of them a picture of pure noise, plus a 22nd from a header-damaged file with `--raw-format s16`. Changes: a VIS "header" must have real header tones (picture content was read as "mode 0x00" and stopped seven files); recordings that start late or stop early decode as partial pictures with grey for the missing lines, numbered from the VIS header, or without one from the sync pulse train (the carrier's ~1 s quiet tail after the last line tells which end is missing); without a VIS header a decode must look like Robot 36 (sync pulses, 1200 Hz sync tone, alternating colour separators) or it is refused as `no Robot 36 picture found`; a sync track far off the 1200 Hz tone is not trusted for FM audio; receiver dropouts no longer pose as the signal or split it, their lines are grey and the carrier fit skips them; lines outside the carrier are grey; `--raw-format s16` reads headerless 16-bit I/Q, and header-damaged WAVs in a folder are skipped with that hint; separator mismatches are counted over the recorded lines only (and grey lines no longer vote on the colour order). 85 tests.
+* **3.5.1** Fix: with a strong signal (in-band SNR of roughly 22 dB and up on synthetic captures), the dropout detector added in 3.5.0 took the ordinary receiver noise before and after the transmission for dropouts, because it compared each frame's total power with the median frame, which a strong signal dominates. Up to about 45 dB that only made the located stretch too long (harmless when the VIS header is read); from about 50 dB it cut the located signal to 15 s and the picture lost 60% of its lines. Frames are now judged by their noise floor (the quieter part of their spectrum, which a signal does not fill), and only near-silence more than 30 dB below the typical floor counts as a dropout, which also leaves room for receiver gain changes (one real capture steps by 9 dB). Pictures from the 65-file test folder are unchanged. 86 tests.
+* **3.5.2** One name everywhere: the installed command is now `robot36_decode` (was `robot36-decode`), matching the package and `python -m robot36_decode`. The `--help` usage line and the `--find-start` `Try:` line show the command the way it was run (`py -m robot36_decode` on Windows, `python3 -m robot36_decode` elsewhere, or `robot36_decode` when installed) instead of a command that may not exist. `pyproject.toml` is now in the zip package, so `pip install .` works there too. No decoding changes. 87 tests.
 * **3.4.0** `--find-start` (report where the image starts, with a confidence rating), `--force-start auto`, and automatic rescue of failed files in directory mode (`*_forced.png`, `--no-rescue` to disable). Start search uses the sync comb, separator parity, a VIS-header template and the VIS decoder when readable; within 1 ms of the normal decoder's start on all five real captures, with or without the VIS reader. Normal decoding is unchanged. 65 tests.
 * **3.3.1** Path arguments: trailing `/` (and `\`) are handled everywhere. `-o dir/` and `--save-audio dir/` with a single input now write `<dir>/<input name>.png`/`.wav` (creating the directory) instead of a file named `dir`; the Windows `"folder\"` quoting quirk is handled. 58 tests.
 * **3.3.0** `--force-start SECONDS`: forced decode of very poor captures from a given start time, with no VIS detection, no sync tracking and no signal search; windowed carrier estimate for FM captures; truncated files padded with grey lines; the "audio too short" error for FM captures now names the located stretch and suggests the option. Normal decoding is unchanged. 55 tests.

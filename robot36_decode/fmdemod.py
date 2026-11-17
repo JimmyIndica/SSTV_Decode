@@ -44,10 +44,12 @@ GAP_S = 4.0  # dropouts (interference, fades) shorter than this do not split the
 DEFAULT_EXPECTED_S = 38.0  # a Robot 36 transmission incl. VIS header and tail
 MAX_F0_JUMP_HZ = 3000.0
 POLY_DEGREE = 3
-# A frame whose power is below this fraction of the median frame power is a
-# dropout (the SDR delivered near-silence), not quiet sky: real noise varies by
-# a few dB, these gaps by 20-30 dB.
-DROPOUT_RATIO = 0.05
+# A frame whose noise floor is this far below the median frame's is a dropout
+# (the SDR delivered digital near-silence: real ones measure 150 dB down), not
+# quiet sky or a receiver gain change (the noise floor of real captures moves
+# by up to ~10 dB when the gain is changed). 30 dB leaves a wide margin both ways.
+DROPOUT_RATIO = 0.001
+DROPOUT_FLOOR_PERCENTILE = 30  # of a frame's spectrum: its noise floor
 
 # Demodulation.
 CHANNEL_HALF_BW_HZ = 7000.0  # wide enough for the full deviation of a strong signal
@@ -256,8 +258,12 @@ def locate_fm_signal(
     # Dropouts must neither set the quiet level of a bin nor look like signal
     # (normalised by the real noise floor, their spectrum is meaningless):
     # give them the typical spectrum of the rest of the capture.
-    frame_power = power.mean(axis=1)
-    dropout = frame_power < DROPOUT_RATIO * np.median(frame_power)
+    # Each frame is judged by its noise floor (the quieter part of its
+    # spectrum: a signal fills only a fraction of the bins), not by its total
+    # power. With a strong signal the median frame is signal, and plain
+    # receiver noise before and after it would look like a dropout.
+    frame_noise = np.percentile(power, DROPOUT_FLOOR_PERCENTILE, axis=1)
+    dropout = frame_noise < DROPOUT_RATIO * np.median(frame_noise)
     if dropout.any() and not dropout.all():
         power = power.copy()
         power[dropout] = np.median(power[~dropout], axis=0)

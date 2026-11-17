@@ -32,7 +32,7 @@ from .fmdemod import (
     locate_fm_signal,
 )
 
-__version__ = "3.5.0"
+__version__ = "3.5.2"
 
 # A sync-tone offset larger than this (Hz) triggers a second pass so VIS
 # detection and band-limiting follow the shifted signal.
@@ -194,8 +194,20 @@ def _estimate_start(args: argparse.Namespace, input_path: Path) -> StartEstimate
     return find_start(audio, rate, t0_s, onset, vis)
 
 
+def _program_name() -> str:
+    """The command as the user typed it, for the help text and command hints.
+
+    The name is ``robot36_decode`` everywhere: the package, ``python -m
+    robot36_decode`` and the command that ``pip install`` creates.
+    """
+    if Path(sys.argv[0]).name == "__main__.py":  # run as "python -m robot36_decode"
+        launcher = "py" if sys.platform == "win32" else "python3"
+        return f"{launcher} -m robot36_decode"
+    return "robot36_decode"
+
+
 def _command_hint(args: argparse.Namespace, input_path: Path, start_s: float) -> str:
-    parts = ["python3 -m robot36_decode", f'"{input_path}"']
+    parts = [_program_name(), f'"{input_path}"']
     if args.format != "wav":
         parts.append(f"--format {args.format}")
     if args.raw_format is not None:
@@ -239,7 +251,7 @@ def _human_time(ms: float) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="robot36-decode",
+        prog=_program_name(),
         description=(
             "Decode a Robot 36 colour SSTV image from a WAV file containing "
             "FM-demodulated SSTV baseband audio."
@@ -454,7 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"%(prog)s {__version__}",
+        version=f"robot36_decode {__version__}",
     )
     return parser
 
@@ -1069,7 +1081,7 @@ def _decode_file(
             output_path,
             rgb,
             scale=args.scale,
-            title=f"robot36-decode v{__version__}",
+            title=f"robot36_decode v{__version__}",
         )
 
         hint = _iq_hint(audio, args)
